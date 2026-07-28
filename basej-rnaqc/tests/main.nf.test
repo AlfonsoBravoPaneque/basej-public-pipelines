@@ -10,6 +10,9 @@ nextflow_pipeline {
                 outputDir    = "${outputDir}"
                 workspace    = "demo"
                 workflow_id  = "test_rnaqc_GRCh38"
+                // rnaqc uses the FULL RNA reference (transcriptome-wide reads need the
+                // full STAR index; chr22-only makes gene detection too sparse for the
+                // PCA/heatmap steps). This test is for MANUAL runs, not the CI suite.
                 input_csv    = "$baseDir/tests/data/inputs/nftest_input.csv"
                 max_memory   = "64.GB"
                 max_cpus     = "8"
