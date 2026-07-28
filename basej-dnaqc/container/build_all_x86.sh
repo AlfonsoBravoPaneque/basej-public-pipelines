@@ -3,7 +3,7 @@
 # Arm variants (ubuntu-arm, seqkit-arm, samtools-arm) are intentionally skipped.
 set -u
 
-BASE="/home/ubuntu/data/nf-bioskryb-utils/pipelines/basej-dnaqc/container"
+BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOGDIR="$BASE/_build_logs"
 mkdir -p "$LOGDIR"
 SUMMARY="$LOGDIR/SUMMARY.log"

@@ -1,0 +1,180 @@
+name: nf-test validation on release
+
+on:
+  push:
+    branches: [release]
+
+env:
+  JAVA_VER: "17"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      pipelines: ${{ steps.changes.outputs.pipelines }}
+      has_changes: ${{ steps.changes.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - id: changes
+        run: |
+          changed=$(git diff --name-only HEAD~1 HEAD | grep -oP '^[^/]+' | sort -u)
+
+          # CI pipelines. All use chr22-only test references (small indices, ~4-6 min
+          # runtimes) so standard ubuntu-latest runners suffice.
+          # EXCLUDED from CI (run manually):
+          #  - basej-rnaqc: needs the full RNA transcriptome reference (chr22-only makes
+          #    gene detection too sparse for its PCA/heatmap).
+          #  - basej-google-deepvariant: CALL_VARIANTS uses a GPU container (--gpus all),
+          #    which GPU-less ubuntu-latest runners cannot run.
+          declare -a entries
+          for dir in basej-dnaqc basej-wgs basej-somatic basej-lineage; do
+            if echo "$changed" | grep -qw "$dir"; then
+              entries+=("\"$dir\"")
+            fi
+          done
+
+          if [ ${#entries[@]} -gt 0 ]; then
+            list=$(printf '%s,' "${entries[@]}" | sed 's/,$//')
+            echo "pipelines=[$list]" >> "$GITHUB_OUTPUT"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pipelines=[]" >> "$GITHUB_OUTPUT"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  nftest:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pipeline: ${{ fromJson(needs.detect-changes.outputs.pipelines) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          # Reclaim ~30GB so the locally-built container images fit on the runner.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo docker system prune -af || true
+          df -h /
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VER }}
+
+      - name: Install Nextflow
+        run: |
+          curl -fsSL get.nextflow.io | bash
+          sudo mv nextflow /usr/local/bin/
+
+      - name: Install nf-test
+        run: |
+          curl -fsSL https://code.askimed.com/install/nf-test | bash
+          sudo mv nf-test /usr/local/bin/
+
+      - name: Build local container images
+        # The public pipelines use locally-built basejumper_* images (not in any
+        # registry). Building them here is itself part of the test: it verifies a
+        # user can build the images from container/ and run the pipeline.
+        # build_all_x86.sh logs each build and records OK/FAILED in SUMMARY.log
+        # without failing the shell, so we grep the summary and fail on any FAILED.
+        run: |
+          bash "${{ matrix.pipeline }}/container/build_all_x86.sh"
+          summary="${{ matrix.pipeline }}/container/_build_logs/SUMMARY.log"
+          echo "===== container build summary ====="; cat "$summary"
+          if grep -q "FAILED" "$summary"; then
+            echo "::error::One or more container images failed to build for ${{ matrix.pipeline }}"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials (Wasabi-backed test data)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_AWS_SECRET_ACCESS_KEY }}
+        run: |
+          mkdir -p ~/.aws
+          cat > ~/.aws/credentials << EOF
+          [default]
+          aws_access_key_id=$AWS_ACCESS_KEY_ID
+          aws_secret_access_key=$AWS_SECRET_ACCESS_KEY
+          EOF
+          echo "AWS_DEFAULT_REGION=us-east-1" >> $GITHUB_ENV
+
+      - name: Point Nextflow at the Wasabi S3 endpoint
+        # The test data lives on the Wasabi-backed bioskryb-public-data bucket. The
+        # provided credentials are Wasabi keys, so Nextflow must use the Wasabi S3
+        # endpoint (otherwise it hits AWS S3 and fails with InvalidAccessKeyId).
+        # A global ~/.nextflow/config keeps the pipeline configs untouched.
+        run: |
+          mkdir -p ~/.nextflow
+          cat > ~/.nextflow/config << 'EOF'
+          aws {
+            region = 'us-east-1'
+            client {
+              endpoint = 'https://s3.us-east-1.wasabisys.com'
+              s3PathStyleAccess = true
+            }
+          }
+          EOF
+
+      - name: Run nf-test
+        working-directory: ${{ matrix.pipeline }}
+        run: nf-test test tests/main.nf.test --tag GRCh38
+
+  create-pr:
+    needs: [detect-changes, nftest]
+    if: always() && needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release
+
+      - name: Create or update PR with validation summary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PIPELINES: ${{ needs.detect-changes.outputs.pipelines }}
+          NFTEST_RESULT: ${{ needs.nftest.result }}
+        run: |
+          pipelines=$(echo "$PIPELINES" | jq -r '.[]')
+
+          if [ "$NFTEST_RESULT" == "success" ]; then
+            icon="✅"; status_text="PASSED"
+          elif [ "$NFTEST_RESULT" == "failure" ]; then
+            icon="❌"; status_text="FAILED"
+          else
+            icon="⚠️"; status_text="$NFTEST_RESULT"
+          fi
+
+          body="## nf-test Validation Summary\n\n"
+          body+="**Overall result:** ${icon} ${status_text}\n\n"
+          body+="| Pipeline | Tested |\n"
+          body+="|----------|--------|\n"
+          for p in $pipelines; do
+            body+="| ${p} | ${icon} |\n"
+          done
+          body+="\n\n---\n"
+          body+="*Triggered by push to \`release\` branch at $(date -u '+%Y-%m-%d %H:%M UTC')*"
+
+          existing=$(gh pr list --head release --base main --state open --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --body "$(printf "$body")"
+            echo "Updated existing PR #$existing"
+          else
+            gh pr create \
+              --title "Release: merge validated pipelines to main" \
+              --body "$(printf "$body")" \
+              --base main \
+              --head release
+            echo "Created new PR"
+          fi
