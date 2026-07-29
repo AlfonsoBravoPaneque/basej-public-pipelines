@@ -17,6 +17,8 @@ jobs:
     outputs:
       pipelines: ${{ steps.changes.outputs.pipelines }}
       has_changes: ${{ steps.changes.outputs.has_changes }}
+      manual_pipelines: ${{ steps.changes.outputs.manual_pipelines }}
+      has_any_changes: ${{ steps.changes.outputs.has_any_changes }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,15 +30,25 @@ jobs:
 
           # CI pipelines. All use chr22-only test references (small indices, ~4-6 min
           # runtimes) so standard ubuntu-latest runners suffice.
-          # EXCLUDED from CI (run manually):
+          # MANUAL pipelines are EXCLUDED from automated nf-test (validated by hand):
           #  - basej-rnaqc: needs the full RNA transcriptome reference (chr22-only makes
           #    gene detection too sparse for its PCA/heatmap).
           #  - basej-google-deepvariant: CALL_VARIANTS uses a GPU container (--gpus all),
           #    which GPU-less ubuntu-latest runners cannot run.
+          ci_dirs="basej-dnaqc basej-wgs basej-somatic basej-lineage"
+          manual_dirs="basej-rnaqc basej-google-deepvariant"
+
           declare -a entries
-          for dir in basej-dnaqc basej-wgs basej-somatic basej-lineage; do
+          for dir in $ci_dirs; do
             if echo "$changed" | grep -qw "$dir"; then
               entries+=("\"$dir\"")
+            fi
+          done
+
+          declare -a manual_entries
+          for dir in $manual_dirs; do
+            if echo "$changed" | grep -qw "$dir"; then
+              manual_entries+=("\"$dir\"")
             fi
           done
 
@@ -47,6 +59,21 @@ jobs:
           else
             echo "pipelines=[]" >> "$GITHUB_OUTPUT"
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ ${#manual_entries[@]} -gt 0 ]; then
+            mlist=$(printf '%s,' "${manual_entries[@]}" | sed 's/,$//')
+            echo "manual_pipelines=[$mlist]" >> "$GITHUB_OUTPUT"
+          else
+            echo "manual_pipelines=[]" >> "$GITHUB_OUTPUT"
+          fi
+
+          # True if ANY pipeline (CI or manual) changed — gates PR creation so that
+          # manual-only pipeline releases still get a release->main PR opened.
+          if [ ${#entries[@]} -gt 0 ] || [ ${#manual_entries[@]} -gt 0 ]; then
+            echo "has_any_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_any_changes=false" >> "$GITHUB_OUTPUT"
           fi
 
   nftest:
@@ -133,7 +160,7 @@ jobs:
 
   create-pr:
     needs: [detect-changes, nftest]
-    if: always() && needs.detect-changes.outputs.has_changes == 'true'
+    if: always() && needs.detect-changes.outputs.has_any_changes == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -144,26 +171,49 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PIPELINES: ${{ needs.detect-changes.outputs.pipelines }}
+          MANUAL_PIPELINES: ${{ needs.detect-changes.outputs.manual_pipelines }}
           NFTEST_RESULT: ${{ needs.nftest.result }}
         run: |
           pipelines=$(echo "$PIPELINES" | jq -r '.[]')
+          manual_pipelines=$(echo "$MANUAL_PIPELINES" | jq -r '.[]')
 
+          # Map the nftest job result to an icon/label. When no CI pipeline changed
+          # the nftest job is skipped, which is expected for manual-only releases.
           if [ "$NFTEST_RESULT" == "success" ]; then
             icon="✅"; status_text="PASSED"
           elif [ "$NFTEST_RESULT" == "failure" ]; then
             icon="❌"; status_text="FAILED"
+          elif [ "$NFTEST_RESULT" == "skipped" ]; then
+            icon="➖"; status_text="no automated nf-test ran"
           else
             icon="⚠️"; status_text="$NFTEST_RESULT"
           fi
 
           body="## nf-test Validation Summary\n\n"
           body+="**Overall result:** ${icon} ${status_text}\n\n"
-          body+="| Pipeline | Tested |\n"
-          body+="|----------|--------|\n"
-          for p in $pipelines; do
-            body+="| ${p} | ${icon} |\n"
-          done
-          body+="\n\n---\n"
+
+          if [ -n "$pipelines" ]; then
+            body+="### Automatically validated (nf-test)\n\n"
+            body+="| Pipeline | Result |\n"
+            body+="|----------|--------|\n"
+            for p in $pipelines; do
+              body+="| ${p} | ${icon} |\n"
+            done
+            body+="\n"
+          fi
+
+          if [ -n "$manual_pipelines" ]; then
+            body+="### Manual validation required (excluded from CI)\n\n"
+            body+="These pipelines have no automated nf-test and must be validated by hand before merge:\n\n"
+            body+="| Pipeline | Result |\n"
+            body+="|----------|--------|\n"
+            for p in $manual_pipelines; do
+              body+="| ${p} | 🔎 manual |\n"
+            done
+            body+="\n"
+          fi
+
+          body+="\n---\n"
           body+="*Triggered by push to \`release\` branch at $(date -u '+%Y-%m-%d %H:%M UTC')*"
 
           existing=$(gh pr list --head release --base main --state open --json number -q '.[0].number')
