@@ -12,8 +12,8 @@ nextflow_pipeline {
                 workflow_id  = "test_GRCh38"
                 input_csv    = "$baseDir/tests/data/inputs/input_qcTest3.csv"
                 genomes_base = "s3://bioskryb-public-data/pipeline_resources/test_genomes"
-                max_memory   = "24.GB"
-                max_cpus     = "8"
+                max_memory   = "12.GB"
+                max_cpus     = "4"
                 architecture = "x86"
                 genome       = "GRCh38"
                 n_reads      = 500000
