@@ -137,10 +137,14 @@ jobs:
           EOF
           echo "AWS_DEFAULT_REGION=us-east-1" >> $GITHUB_ENV
 
-      - name: Point Nextflow at the Wasabi S3 endpoint
-        # The test data lives on the Wasabi-backed bioskryb-public-data bucket. The
-        # provided credentials are Wasabi keys, so Nextflow must use the Wasabi S3
-        # endpoint (otherwise it hits AWS S3 and fails with InvalidAccessKeyId).
+      - name: Configure Nextflow for the runner (Wasabi endpoint + resource caps)
+        # 1. The test data lives on the Wasabi-backed bioskryb-public-data bucket. The
+        #    provided credentials are Wasabi keys, so Nextflow must use the Wasabi S3
+        #    endpoint (otherwise it hits AWS S3 and fails with InvalidAccessKeyId).
+        # 2. The nf-test params request max_cpus=8 / max_memory=24.GB, but a standard
+        #    ubuntu-latest runner only has 4 CPUs / 16 GB. process.resourceLimits caps
+        #    every process to what the runner actually has, so we don't need to edit
+        #    (and republish) the pipeline test files. Leaves headroom for the JVM/Docker.
         # A global ~/.nextflow/config keeps the pipeline configs untouched.
         run: |
           mkdir -p ~/.nextflow
@@ -151,6 +155,9 @@ jobs:
               endpoint = 'https://s3.us-east-1.wasabisys.com'
               s3PathStyleAccess = true
             }
+          }
+          process {
+            resourceLimits = [ cpus: 4, memory: 14.GB ]
           }
           EOF
 
