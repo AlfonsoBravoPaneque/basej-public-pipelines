@@ -6,6 +6,12 @@ on:
 
 env:
   JAVA_VER: "17"
+  # Pin Nextflow to the version the public pipelines were transformed and validated
+  # against. The publish transform injects helper closures (e.g. resolveParam,
+  # findPileupTree) whose scoping is accepted by 25.10.2 but rejected by the stricter
+  # 26.x parser ("... is not defined"), so the transformed code only compiles on 25.x.
+  # Revisit once the transform is updated for 26.x. Nextflow self-selects via NXF_VER.
+  NXF_VER: "25.10.2"
 
 permissions:
   contents: write
@@ -137,15 +143,16 @@ jobs:
           EOF
           echo "AWS_DEFAULT_REGION=us-east-1" >> $GITHUB_ENV
 
-      - name: Configure Nextflow for the runner (Wasabi endpoint + resource caps)
-        # 1. The test data lives on the Wasabi-backed bioskryb-public-data bucket. The
-        #    provided credentials are Wasabi keys, so Nextflow must use the Wasabi S3
-        #    endpoint (otherwise it hits AWS S3 and fails with InvalidAccessKeyId).
-        # 2. The nf-test params request max_cpus=8 / max_memory=24.GB, but a standard
-        #    ubuntu-latest runner only has 4 CPUs / 16 GB. process.resourceLimits caps
-        #    every process to what the runner actually has, so we don't need to edit
-        #    (and republish) the pipeline test files. Leaves headroom for the JVM/Docker.
+      - name: Point Nextflow at the Wasabi S3 endpoint
+        # The test data lives on the Wasabi-backed bioskryb-public-data bucket. The
+        # provided credentials are Wasabi keys, so Nextflow must use the Wasabi S3
+        # endpoint (otherwise it hits AWS S3 and fails with InvalidAccessKeyId).
         # A global ~/.nextflow/config keeps the pipeline configs untouched.
+        #
+        # Resource caps are handled by the pipelines themselves: conf/environment.config
+        # sets process.resourceLimits = [cpus: params.max_cpus, memory: params.max_memory],
+        # and the nf-test files request max_cpus=4 / max_memory=12.GB so every process
+        # fits a standard ubuntu-latest runner (4 CPU / 16 GB).
         run: |
           mkdir -p ~/.nextflow
           cat > ~/.nextflow/config << 'EOF'
@@ -155,9 +162,6 @@ jobs:
               endpoint = 'https://s3.us-east-1.wasabisys.com'
               s3PathStyleAccess = true
             }
-          }
-          process {
-            resourceLimits = [ cpus: 4, memory: 14.GB ]
           }
           EOF
 
