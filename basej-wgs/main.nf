@@ -492,7 +492,11 @@ process BWAMEM2_ALIGN_DEDUP_METRICS {
     # pass first, and fixmate requires name-grouped input. Uncompressed (-u)
     # intermediates skip pointless compress/decompress between samtools steps.
     BWA_INDEX="${bwamem2_index_dir}/genome.fa"
-    bwa-mem2 mem -M -Y -K 2500000000 \\
+    # Binary overridable via BWAMEM2_BIN (default: the auto-dispatching bwa-mem2).
+    # CI sets BWAMEM2_BIN=bwa-mem2.avx2: the bwa-mem2 dispatcher may pick the AVX-512
+    # build on runners whose CPU can't actually run those instructions, crashing with
+    # no output (samtools then fails to read the header).
+    \${BWAMEM2_BIN:-bwa-mem2} mem -M -Y -K 2500000000 \\
         -R "@RG\\tID:${sample_name}\\tSM:${sample_name}\\tPL:${platform}" \\
         -t ${task.cpus} \$BWA_INDEX '${r1}' '${r2}' | \\
         samtools sort -n -u -@ ${task.cpus} -o ${sample_name}_namesorted.bam -
