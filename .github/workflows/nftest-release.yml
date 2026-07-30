@@ -143,11 +143,22 @@ jobs:
           EOF
           echo "AWS_DEFAULT_REGION=us-east-1" >> $GITHUB_ENV
 
-      - name: Point Nextflow at the Wasabi S3 endpoint
-        # The test data lives on the Wasabi-backed bioskryb-public-data bucket. The
-        # provided credentials are Wasabi keys, so Nextflow must use the Wasabi S3
-        # endpoint (otherwise it hits AWS S3 and fails with InvalidAccessKeyId).
-        # A global ~/.nextflow/config keeps the pipeline configs untouched.
+      - name: Configure Nextflow for the runner (Wasabi endpoint, bwa-mem2 build, container uid)
+        # A global ~/.nextflow/config keeps the pipeline configs untouched. It sets:
+        # 1. aws.client.endpoint — the test data lives on the Wasabi-backed
+        #    bioskryb-public-data bucket and the provided keys are Wasabi keys, so
+        #    Nextflow must target the Wasabi S3 endpoint (else InvalidAccessKeyId).
+        # 2. env.BWAMEM2_BIN — force the AVX2 bwa-mem2 build. The default `bwa-mem2`
+        #    dispatcher inspects /proc/cpuinfo and can pick the AVX-512 build, but
+        #    GitHub's Azure runners have heterogeneous CPUs and some cannot execute
+        #    those instructions (illegal instruction -> no output -> empty channels).
+        #    Pipeline scripts use the BWAMEM2_BIN override, so production (unset) keeps
+        #    the auto-dispatcher.
+        # 3. docker.runOptions -u <uid>:<gid> — run every task container as the runner
+        #    user that owns the work dir. Some basejumper_* images run as a non-root
+        #    "appuser" whose UID differs from the runner's, so without this they cannot
+        #    write .command.trace ("touch: cannot touch '.command.trace': Permission
+        #    denied") -> the task fails -> Ginkgo empties -> PublishOp crash.
         #
         # Resource caps are handled by the pipelines themselves: conf/environment.config
         # sets process.resourceLimits = [cpus: params.max_cpus, memory: params.max_memory],
@@ -163,7 +174,18 @@ jobs:
               s3PathStyleAccess = true
             }
           }
+          env {
+            BWAMEM2_BIN = 'bwa-mem2.avx2'
+          }
           EOF
+          # Append docker.runOptions with the runner's real uid:gid (unquoted heredoc
+          # so $(id -u)/$(id -g) expand to numbers written literally into the config).
+          cat >> ~/.nextflow/config << EOF
+          docker {
+              runOptions = '-u $(id -u):$(id -g)'
+          }
+          EOF
+          echo "===== effective ~/.nextflow/config ====="; cat ~/.nextflow/config
 
       - name: Run nf-test
         working-directory: ${{ matrix.pipeline }}
@@ -177,22 +199,24 @@ jobs:
         if: failure()
         working-directory: ${{ matrix.pipeline }}
         run: |
-          echo "=================== nextflow.log(s) ==================="
-          find .nf-test -type f -path "*/meta/nextflow.log" | while read -r log; do
-            echo "########## $log ##########"
-            cat "$log"
-          done
-          echo "============ failed task .command.* dumps ============"
+          # Print failed-task stderr FIRST (this is usually the real root cause),
+          # then only a tail of the large nextflow.log so it doesn't bury the errors.
+          echo "############ failed task .command.* dumps ############"
           # A task failed if its .exitcode is missing or non-zero.
           find .nf-test -type f -name ".exitcode" | while read -r ec; do
             code=$(cat "$ec" 2>/dev/null || echo "NA")
             if [ "$code" != "0" ]; then
               d=$(dirname "$ec")
-              echo "########## FAILED task ($code): $d ##########"
+              echo "########## FAILED task (exit=$code): $d ##########"
               for f in .command.sh .command.err .command.out .command.log; do
                 if [ -s "$d/$f" ]; then echo "----- $f -----"; cat "$d/$f"; fi
               done
             fi
+          done
+          echo "=============== nextflow.log (tail) =================="
+          find .nf-test -type f -path "*/meta/nextflow.log" | while read -r log; do
+            echo "########## $log (last 120 lines) ##########"
+            tail -n 120 "$log"
           done
 
   create-pr:
