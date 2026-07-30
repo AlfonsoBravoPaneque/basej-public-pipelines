@@ -49,10 +49,11 @@ nextflow_pipeline {
                     // Values from chr22-only test reference (genomes_base = test_genomes).
                     // total_reads/final_reads are pre-alignment counts (unchanged by ref);
                     // qc_status/qc_score reflect chr22-only mapping (Borderline/3).
-                    // NOTE: a zero-read sample (DNAQC-test1-0reads) is intentionally excluded here.
-                    // A 0-read sample currently aborts the whole workflow (an index'd output
-                    // channel empties and Nextflow's PublishOp fails), so it's a separate
-                    // pipeline-robustness fix, not a CI concern.
+                    // NOTE: the zero-read sample (DNAQC-test1-0reads) is excluded here to keep
+                    // the CI test to representative samples. (The earlier CI crash was NOT the
+                    // 0-read sample itself but a container bug: binUnsorted/CNVcaller were copied
+                    // into the ginkgo image without an execute bit, so Ginkgo failed and its
+                    // ifEmpty guards + PublishOp then crashed. Fixed in the ginkgo Dockerfile.)
                     def expected = [
                         'chr22_testsample1':   [total_reads: 4132446, final_reads: 498686, subsampled: 'True', qc_status: 'Borderline', qc_score: 3],
                         'chr22_testsample2':   [total_reads: 4132446, final_reads: 498686, subsampled: 'True', qc_status: 'Borderline', qc_score: 3],
