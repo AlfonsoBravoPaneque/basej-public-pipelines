@@ -169,6 +169,32 @@ jobs:
         working-directory: ${{ matrix.pipeline }}
         run: nf-test test tests/main.nf.test --tag GRCh38
 
+      - name: Dump nf-test Nextflow logs on failure
+        # nf-test writes the run's nextflow.log under .nf-test/tests/<hash>/meta/.
+        # On failure the console only shows "Cannot access first() ..." and points
+        # at that log, which lives on the runner. Print the log plus the stderr of
+        # every failed task so the real root cause is visible in the job output.
+        if: failure()
+        working-directory: ${{ matrix.pipeline }}
+        run: |
+          echo "=================== nextflow.log(s) ==================="
+          find .nf-test -type f -path "*/meta/nextflow.log" | while read -r log; do
+            echo "########## $log ##########"
+            cat "$log"
+          done
+          echo "============ failed task .command.* dumps ============"
+          # A task failed if its .exitcode is missing or non-zero.
+          find .nf-test -type f -name ".exitcode" | while read -r ec; do
+            code=$(cat "$ec" 2>/dev/null || echo "NA")
+            if [ "$code" != "0" ]; then
+              d=$(dirname "$ec")
+              echo "########## FAILED task ($code): $d ##########"
+              for f in .command.sh .command.err .command.out .command.log; do
+                if [ -s "$d/$f" ]; then echo "----- $f -----"; cat "$d/$f"; fi
+              done
+            fi
+          done
+
   create-pr:
     needs: [detect-changes, nftest]
     if: always() && needs.detect-changes.outputs.has_any_changes == 'true'

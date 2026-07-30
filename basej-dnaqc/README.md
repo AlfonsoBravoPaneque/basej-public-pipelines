@@ -290,6 +290,8 @@ nf-test test
 nf-test test tests/main.nf.test --tag GRCh38
 ```
 
+> The `GRCh38` opensource test is the one exercised automatically by the release CI.
+
 
 # Need Help?
 
