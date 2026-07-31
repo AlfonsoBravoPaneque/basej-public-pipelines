@@ -52,7 +52,7 @@ process SEQKIT_SAMPLE {
 
     output:
     tuple val(sample_name), path("${sample_name}_subsampled_R*.fastq.gz"), emit: reads
-    tuple val(sample_name), env(TOTAL_READS), env(FINAL_READS), emit: read_counts
+    tuple val(sample_name), env('TOTAL_READS'), env('FINAL_READS'), emit: read_counts
     path("${sample_name}_read_counts.txt"), emit: read_counts_file
 
     script:
@@ -124,7 +124,7 @@ process SAMTOOLS_SUBSAMPLE_CRAM {
 
     output:
     tuple val(sample_name), path("${sample_name}.cram"), path("${sample_name}.cram.crai"), emit: cram
-    tuple val(sample_name), env(TOTAL_READS), env(FINAL_READS), emit: read_counts
+    tuple val(sample_name), env('TOTAL_READS'), env('FINAL_READS'), emit: read_counts
     path("${sample_name}_read_counts.txt"), emit: read_counts_file
 
     script:
@@ -350,8 +350,12 @@ process BWAMEM2_ALIGN {
         set +u
 
         BWA_INDEX="${bwamem2_index_dir}/genome.fa"
-        # BWA-MEM2 alignment piped to samtools sort
-        bwa-mem2 mem -M -Y -K 2500000000 \\
+        # BWA-MEM2 alignment piped to samtools sort.
+        # Binary overridable via BWAMEM2_BIN (default: the auto-dispatching bwa-mem2).
+        # CI sets BWAMEM2_BIN=bwa-mem2.avx2: the bwa-mem2 dispatcher may pick the
+        # AVX-512 build on runners whose CPU can't actually run those instructions,
+        # crashing with no output (samtools then fails to read the header).
+        \${BWAMEM2_BIN:-bwa-mem2} mem -M -Y -K 2500000000 \\
             -R "@RG\\tID:${sample_name}\\tSM:${sample_name}\\tPL:${platform}" \\
             -t ${task.cpus} \$BWA_INDEX ${r1} ${r2} | \\
             samtools sort -@ ${task.cpus} -o ${sample_name}_sorted.bam -
