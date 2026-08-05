@@ -36,13 +36,14 @@ jobs:
 
           # CI pipelines. All use chr22-only test references (small indices, ~4-6 min
           # runtimes) so standard ubuntu-latest runners suffice.
+          #  - basej-google-deepvariant: runs CPU-only in CI via the pipeline's
+          #    `test_cpu` profile (set in its nf-test.config) — CALL_VARIANTS uses the
+          #    plain google/deepvariant image with no --gpus, so no GPU is needed.
           # MANUAL pipelines are EXCLUDED from automated nf-test (validated by hand):
           #  - basej-rnaqc: needs the full RNA transcriptome reference (chr22-only makes
           #    gene detection too sparse for its PCA/heatmap).
-          #  - basej-google-deepvariant: CALL_VARIANTS uses a GPU container (--gpus all),
-          #    which GPU-less ubuntu-latest runners cannot run.
-          ci_dirs="basej-dnaqc basej-wgs basej-somatic basej-lineage"
-          manual_dirs="basej-rnaqc basej-google-deepvariant"
+          ci_dirs="basej-dnaqc basej-wgs basej-somatic basej-lineage basej-google-deepvariant"
+          manual_dirs="basej-rnaqc"
 
           declare -a entries
           for dir in $ci_dirs; do
@@ -116,13 +117,22 @@ jobs:
           sudo mv nf-test /usr/local/bin/
 
       - name: Build local container images
-        # The public pipelines use locally-built basejumper_* images (not in any
+        # Most public pipelines use locally-built basejumper_* images (not in any
         # registry). Building them here is itself part of the test: it verifies a
         # user can build the images from container/ and run the pipeline.
         # build_all_x86.sh logs each build and records OK/FAILED in SUMMARY.log
         # without failing the shell, so we grep the summary and fail on any FAILED.
+        #
+        # Some pipelines (e.g. basej-google-deepvariant) ship no container/ build
+        # script — they pull public images (google/deepvariant, quay biocontainers)
+        # at task time — so we skip the build step for them.
         run: |
-          bash "${{ matrix.pipeline }}/container/build_all_x86.sh"
+          build_script="${{ matrix.pipeline }}/container/build_all_x86.sh"
+          if [ ! -f "$build_script" ]; then
+            echo "No container build script for ${{ matrix.pipeline }} — uses public images, skipping build."
+            exit 0
+          fi
+          bash "$build_script"
           summary="${{ matrix.pipeline }}/container/_build_logs/SUMMARY.log"
           echo "===== container build summary ====="; cat "$summary"
           if grep -q "FAILED" "$summary"; then
