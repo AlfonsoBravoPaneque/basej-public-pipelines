@@ -33,7 +33,7 @@ basej-public-pipelines/
 Pick the pipeline you need from the table above and follow the `README.md` inside
 its directory for setup, inputs, run commands, options, and outputs.
 
-To obtain the reference-genome bundles and container images needed to run these
+To obtain the reference-genome bundles and pipeline resources needed to run these
 pipelines, email [basejumper@bioskryb.com](mailto:basejumper@bioskryb.com).
 
 ## Need help?
