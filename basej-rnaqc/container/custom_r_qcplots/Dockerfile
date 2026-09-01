@@ -1,11 +1,12 @@
 # custom_r_qcplots container (RNA QC version)
 # Provides: R 4.5.x with extensive package set (ohchibi, ggpubr, dplyr, etc.)
 #           plus Python 3 with pyarrow for Parquet output
-# Scripts: rna_qc_plot.R, htseq_summarydf_to_matrix.R
-# Tag: custom_r_qcplots_0.2.3
+# Scripts: rna_qc_plot.R, htseq_summarydf_to_matrix.R,
+#          qc_scoring.R + qc_scoring_specs.R (shared 1-5 tier scoring)
+# Tag: custom_r_qcplots_0.3.0
 #
 # Build:
-#   docker build -t basejumper_custom_r_qcplots_0.2.3 .
+#   docker build -t basejumper_custom_r_qcplots_0.3.0 .
 #
 # Note: This is a full rebuild Dockerfile. Build time is significant (~30-45 min)
 # due to R package compilation.

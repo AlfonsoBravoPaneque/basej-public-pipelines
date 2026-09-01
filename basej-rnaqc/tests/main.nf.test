@@ -29,6 +29,39 @@ nextflow_pipeline {
 
                 { assert path("${outputDir}/workflow_outputs/demo/test_rnaqc_GRCh38/reports/multiqc_report.html").exists() },
 
+                // MultiQC still builds and the rnaqc_summary table renders the three new
+                // Qualimap bias columns alongside every pre-existing column (clauses 2.7, 3.6)
+                {
+                    def html = path("${outputDir}/workflow_outputs/demo/test_rnaqc_GRCh38/reports/multiqc_report.html")
+                                   .readLines().join('\n')
+                    def lower = html.toLowerCase()
+
+                    // Display keys, as written in the Step-4 *_selected_metrics_mqc.txt header
+                    // and in the rnaqc_summary pconfig. MultiQC derives the table column ids
+                    // from them, so a case-insensitive match is the stable check.
+                    ['Bias5Prime', 'Bias3Prime', 'Bias5Prime3Prime'].each { key ->
+                        assert lower.contains(key.toLowerCase()) : "MultiQC report missing bias column key: ${key}"
+                    }
+
+                    // Column titles. MultiQC may HTML-escape the apostrophe, so accept variants.
+                    def hasTitle = { t ->
+                        [t, t.replace("'", "&#39;"), t.replace("'", "&#x27;"), t.replace("'", "&apos;")]
+                            .any { html.contains(it) }
+                    }
+                    ["5' Bias", "3' Bias", "5'-3' Bias"].each { t ->
+                        assert hasTitle(t) : "MultiQC rnaqc_summary table missing column title: ${t}"
+                    }
+
+                    // Pre-existing rnaqc_summary columns must all still render (clause 3.6)
+                    ['QC Status', 'Score', 'Proportion Mappable', 'Proportion Exonic',
+                     'Proportion Intergenic', 'Proportion Intronic', 'Proportion Mitochondrial',
+                     'Proportion Ribosomal', 'Protein Coding Genes', 'Total Reads', 'Final Reads',
+                     'Proportion Q30', 'Proportion Filtered', 'Proportion Low Quality',
+                     'Proportion Too Short'].each { t ->
+                        assert html.contains(t) : "MultiQC rnaqc_summary table lost pre-existing column: ${t}"
+                    }
+                },
+
                 // Check rnaqc_all_metrics.tsv exists and has correct structure
                 {
                     def f = path("${outputDir}/workflow_outputs/demo/test_rnaqc_GRCh38/metrics/rnaqc_metrics/rnaqc_all_metrics.tsv")
@@ -39,13 +72,18 @@ nextflow_pipeline {
                     // Required columns must be present
                     ['qc_score', 'qc_status', 'total_reads', 'final_reads', 'subsampled',
                      'star_uniquely_mapped_pct', 'genes_detected_total', 'mt_pct',
-                     'prop_exonic', 'prop_intronic', 'prop_intergenic'].each { col ->
+                     'prop_exonic', 'prop_intronic', 'prop_intergenic',
+                     'bias_5prime', 'bias_3prime', 'bias_5prime_3prime',
+                     'RatioTranscriptBody', 'RangeTranscriptBody', 'MedianCoverageTranscriptBody'].each { col ->
                         assert header.contains(col) : "Missing column: ${col}"
                     }
 
                     def idx = { col -> header.indexOf(col) }
                     def dbl = { v -> (v && v != 'None' && !v.isEmpty()) ? v.toDouble() : null }
                     def lng = { v -> (v && v != 'None' && !v.isEmpty()) ? v.toLong()   : null }
+                    // Tolerant numeric parse for nullable metrics: '', 'None', 'NA' and 'nan'
+                    // all come back as null instead of throwing.
+                    def num = { v -> (v ==~ /-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?/) ? v.toDouble() : null }
 
                     // Expected values per sample (pre-subsampled data, ~100-200K reads per sample)
                     def expected = [
@@ -88,6 +126,79 @@ nextflow_pipeline {
                         // prop_exonic: >0.5 for RNA (majority of reads map to exons)
                         def propExonic = dbl(cols[idx('prop_exonic')].trim())
                         if (propExonic != null) assert propExonic >= 0.5 && propExonic <= 1.0 : "prop_exonic out of range for ${sample}: ${propExonic}"
+
+                        // bias_*: Qualimap transcript-coverage-bias ratios. Real RNA data sits
+                        // well under 5. null is tolerated: a biosample can legitimately have no
+                        // row in qualimap_stats_mqc.csv (e.g. a zero-read sample), in which case
+                        // all three are null by design.
+                        ['bias_5prime', 'bias_3prime', 'bias_5prime_3prime'].each { col ->
+                            def bias = num(cols[idx(col)].trim())
+                            if (bias != null) assert bias > 0.0 && bias < 5.0 : "${col} out of range for ${sample}: ${bias}"
+                        }
+
+                        // Gene body coverage: RatioTranscriptBody ~ 1 and MedianCoverageTranscriptBody
+                        // in [0,1] for real data; null tolerated (skipped or genome without a
+                        // housekeeping-gene bed). RangeTranscriptBody is an "a-b-c" string.
+                        def gbRatio = num(cols[idx('RatioTranscriptBody')].trim())
+                        if (gbRatio != null) assert gbRatio > 0.0 && gbRatio < 5.0 : "RatioTranscriptBody out of range for ${sample}: ${gbRatio}"
+                        def gbMedian = num(cols[idx('MedianCoverageTranscriptBody')].trim())
+                        if (gbMedian != null) assert gbMedian >= 0.0 && gbMedian <= 1.0 : "MedianCoverageTranscriptBody out of range for ${sample}: ${gbMedian}"
+                        def gbRange = cols[idx('RangeTranscriptBody')].trim()
+                        if (gbRange && gbRange != 'NA' && gbRange != 'None' && !gbRange.isEmpty())
+                            assert gbRange ==~ /-?\d+(\.\d+)?--?\d+(\.\d+)?--?\d+(\.\d+)?/ : "RangeTranscriptBody malformed for ${sample}: ${gbRange}"
+                    }
+                },
+
+                // Raw Qualimap table is published (clause 2.6), and the bias values in the
+                // metrics table are value-faithful to it — the end-to-end value check.
+                // NOTE: parquet contents are not readable from Groovy (no test in this repo
+                // parses one), so rnaqc_all_metrics.tsv stands in for the parquet here: both
+                // are written from the same `all_summaries` dicts in the same Step-4 block.
+                {
+                    def qFile = path("${outputDir}/workflow_outputs/demo/test_rnaqc_GRCh38/metrics/rnaqc_metrics/qualimap_stats_mqc.csv")
+                    assert qFile.exists() : "qualimap_stats_mqc.csv was not published"
+
+                    // parse_qualimap.R writes with quote = FALSE and strips commas from values,
+                    // so a plain comma split is safe and the headers keep the raw Qualimap
+                    // spelling: 'bam file' (space, not dot), "5' bias", "3' bias", "5'-3' bias".
+                    def qLines  = qFile.readLines().findAll { it.trim() }
+                    def qHeader = qLines[0].split(',', -1).collect { it.trim() }
+                    def biasCols = ["5' bias": 'bias_5prime', "3' bias": 'bias_3prime', "5'-3' bias": 'bias_5prime_3prime']
+                    (['bam file'] + biasCols.keySet().toList()).each { col ->
+                        assert qHeader.contains(col) : "Missing column in qualimap_stats_mqc.csv: ${col}"
+                    }
+
+                    def num = { v -> (v ==~ /-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?/) ? v.toDouble() : null }
+
+                    // Same path / .bam / _Aligned.sortedByCoord.out stripping the pipeline does
+                    // when it derives biosampleName from the 'bam file' column.
+                    def csvBias = [:]
+                    for (int i = 1; i < qLines.size(); i++) {
+                        def c  = qLines[i].split(',', -1).collect { it.trim() }
+                        def bs = c[qHeader.indexOf('bam file')]
+                                     .replaceAll('.*/', '')
+                                     .replace('.bam', '')
+                                     .replace('_Aligned.sortedByCoord.out', '')
+                        csvBias[bs] = biasCols.collectEntries { src, dst -> [dst, num(c[qHeader.indexOf(src)])] }
+                    }
+                    assert !csvBias.isEmpty() : "qualimap_stats_mqc.csv has no data rows"
+
+                    def m       = path("${outputDir}/workflow_outputs/demo/test_rnaqc_GRCh38/metrics/rnaqc_metrics/rnaqc_all_metrics.tsv").readLines()
+                    def mHeader = m[0].split('\t').toList()
+
+                    for (int i = 1; i < m.size(); i++) {
+                        def cols   = m[i].split('\t', -1)
+                        def sample = cols[0]
+                        biasCols.each { src, dst ->
+                            def got = num(cols[mHeader.indexOf(dst)].trim())
+                            def exp = csvBias.containsKey(sample) ? csvBias[sample][dst] : null
+                            if (exp == null) {
+                                assert got == null : "${dst} for ${sample} should be null (no numeric '${src}' cell in qualimap_stats_mqc.csv), got ${got}"
+                            } else {
+                                assert got != null : "${dst} for ${sample} is null but qualimap_stats_mqc.csv has '${src}' = ${exp}"
+                                assert Math.abs(got - exp) <= 1e-6 : "${dst} for ${sample} = ${got} does not match qualimap_stats_mqc.csv '${src}' = ${exp}"
+                            }
+                        }
                     }
                 },
 

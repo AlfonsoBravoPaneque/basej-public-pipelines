@@ -3,6 +3,16 @@ library(dplyr)
 library(ggtree)
 library(optparse)
 
+# Shared 1-5 tier scoring, and the per-assay threshold specs.
+# Installed to /usr/local/bin in the container; falls back to the script's own directory so
+# the script can be run straight from the repo.
+for (.f in c("qc_scoring.R", "qc_scoring_specs.R")) {
+  .p <- c(file.path("/usr/local/bin", .f), .f)
+  .hit <- .p[file.exists(.p)]
+  if (!length(.hit)) stop(sprintf("%s not found in /usr/local/bin or the working directory", .f))
+  source(.hit[1])
+}
+
 set.seed(130816)
 
 bskb_col<-c("#12284C", "#1082A2","#A0CC2C" , "#DD14D3","#F45D34","#777776", "firebrick","orange","darkgreen","pink")
@@ -19,18 +29,42 @@ filter_expresion_matrix <- function(expr_mat, min_num_cells_per_gene, sample_nam
 
 normalize_matrix <- function(expr_mat) {
   #Rows should be samples 
-  expr_normed_mat <- t(apply(expr_mat, 1, function(.row) {log((.row/sum(.row)) * 10000  + 1)}))
+  # Guard against zero-count samples: a row summing to 0 yields NaN (0/0), which
+  # propagates into every gene's mean/var and then crashes cut() in get_dispersion().
+  # Such empty samples normalise to all-zero so they stay visible in QC but finite.
+  expr_normed_mat <- t(apply(expr_mat, 1, function(.row) {
+    denom <- sum(.row)
+    if (denom == 0) {
+      zeros <- rep(0, length(.row))
+      names(zeros) <- names(.row)   # preserve gene names so apply keeps dimnames
+      return(zeros)
+    }
+    log((.row / denom) * 10000 + 1)
+  }))
   return(expr_normed_mat)
 }
 
 get_dispersion <- function(log_normed_mat, topn = 500)  {
+  # Handle edge case: with fewer than 2 genes, apply() returns a vector
+  # rather than a matrix and the binning below is meaningless.
+  if (ncol(log_normed_mat) < 2) {
+    warning("Too few genes for dispersion analysis, returning input matrix")
+    return(log_normed_mat)
+  }
   temp_mean_and_var <- apply(log_normed_mat, 2, function(.col)  {
     return(c(mean(.col), var(.col)))
   })
+  # Ensure result is a matrix (apply returns a vector when ncol == 1)
+  if (!is.matrix(temp_mean_and_var)) {
+    temp_mean_and_var <- matrix(temp_mean_and_var, nrow = 2,
+                                dimnames = list(NULL, colnames(log_normed_mat)))
+  }
   temp_disp_mean_df <- data.frame(ensembl = colnames(temp_mean_and_var), mean_normed_gene_expr = temp_mean_and_var[1,], var_normed_gene_exp = temp_mean_and_var[2,], exp_bin = cut(temp_mean_and_var[1,], 20), stringsAsFactors = FALSE) %>% dplyr::mutate(gene_normed_exp_disp = var_normed_gene_exp/mean_normed_gene_expr)
   temp_disp_mean_df <- dplyr::left_join(temp_disp_mean_df, {dplyr::group_by(temp_disp_mean_df, exp_bin) %>% dplyr::summarize(mean_bin_expression = mean(mean_normed_gene_expr), mean_bin_dispersion = mean(gene_normed_exp_disp), sd_bin_dispersion = sd(gene_normed_exp_disp))}) %>% dplyr:: mutate(abs_normalized_bin_dispersion_deviation = abs((gene_normed_exp_disp - mean_bin_dispersion) / sd_bin_dispersion))
   temp_disp_mean_df <- dplyr::arrange(temp_disp_mean_df, desc(abs_normalized_bin_dispersion_deviation))
-  topn_dispersed_mat <- log_normed_mat[,temp_disp_mean_df$ensembl[1:topn]]
+  # Never request more genes than exist, and keep the matrix 2-D for a single gene
+  topn <- min(topn, nrow(temp_disp_mean_df))
+  topn_dispersed_mat <- log_normed_mat[,temp_disp_mean_df$ensembl[1:topn], drop = FALSE]
   return(topn_dispersed_mat)
 }
 
@@ -77,6 +111,16 @@ plot_qc_rna <- function(matrix_file = NULL,
                         cutoff_PropIntergenic = 0.1,
                         cutoff_ProportionCountsMitochondrialGenes = 0.1,
                         cutoff_ProteinCodingGenesDetected = 500,
+                        # tier-5 (Excellent) tightening; tier 4 keeps the gate values above
+                        tight_PropExonic = 0.8,
+                        tight_ProportionCountsMitochondrialGenes = 0.05,
+                        tight_ProteinCodingGenesDetected = 2000,
+                        # tier-3 (Borderline) relaxation
+                        borderline_ProteinCodingGenesDetected = 250,
+                        borderline_ProportionCountsMitochondrialGenes = 0.2,
+                        # RNA has no established absolute read floor, so depth is judged
+                        # against the run median (see qc_depth_floor)
+                        depth_floor_median_frac = 0.5,
                         size_labels_samples = 1,
                         relative_size_heatmap = 1,
                         relative_size_mappability = 0.2,
@@ -90,6 +134,14 @@ plot_qc_rna <- function(matrix_file = NULL,
   
   #Read tables and determine usable samples
   Tab <- read.table(file = matrix_file,header = TRUE,row.names = 1,check.names = FALSE) %>% t
+
+  # Guard: rows of Tab are samples. Samples with zero total counts carry no
+  # expression data. cut()/clustering require at least a few samples with
+  # signal, so fail early with a clear message instead of a cryptic R error.
+  if (sum(rowSums(Tab) > 0) < 3) {
+    stop(paste0("Error: Only ", sum(rowSums(Tab) > 0),
+                " sample(s) have any gene counts. At least 3 non-empty samples are required for QC plots. Please check your input data."))
+  }
   
   
   #Read information about 
@@ -194,26 +246,57 @@ plot_qc_rna <- function(matrix_file = NULL,
   Map$SampleId <- Map$SampleId %>% 
     factor(levels = clust_samples$order %>% clust_samples$labels[.])
   
-  #### Construct the clustered version of the figures with composite score logic
-  Mat <- matrix(data = 0,nrow = nrow(Map),ncol = 5)
-  rownames(Mat) <- Map$SampleId
-  
-  Mat[,1][which(Map$PropMappability > cutoff_PropMappability)] <- 1
-  Mat[,2][which(Map$PropExonic > cutoff_PropExonic)] <- 1
-  Mat[,3][which(Map$PropIntergenic < cutoff_PropIntergenic)] <- 1
-  Mat[,4][which(Map$ProportionCountsMitochondrialGenes < cutoff_ProportionCountsMitochondrialGenes)] <- 1
-  Mat[,5][which(Map$ProteinCodingGenesDetected > cutoff_ProteinCodingGenesDetected)] <- 1
-  
-  #Create sum and that will become the cluster
-  df_clust <- rowSums(Mat) %>% data.frame %>%
-    tibble::rownames_to_column() %>% 
-    dplyr::rename(.data =.,SampleId = rowname, Cluster = ".")
-  
-  df_clust$Cluster <- df_clust$Cluster %>% factor(levels = c("5","4","3","2","1","0"))
-  
-  #Create the representation with  quality 
+  #### Assign the 1-5 quality tier (see qc_scoring.R)
+  #
+  # Replaces the previous count of passed thresholds. A tier now requires ALL of its
+  # conditions, so a cell cannot rank above its weakest metric - under the old count a cell
+  # failing a gate outright still displayed in the second band. Tier 4 keeps the original gate
+  # values, so tier >= 4 equals the old "all five pass" and the PASS/Borderline/FAIL mapping
+  # applied downstream in main.nf (>=4 PASS, ==3 Borderline, else FAIL) is unchanged.
+  #
+  # RNA is not gated on read count: no absolute per-cell target is established for the assay,
+  # so depth is judged against the run median instead. Aligned reads are the relevant depth,
+  # approximated as post-filter reads x mappability when both are available.
+  reads_depth <- suppressWarnings(as.numeric(
+    if ("FinalReads" %in% colnames(Map)) Map$FinalReads
+    else if ("TotalReads" %in% colnames(Map)) Map$TotalReads
+    else rep(NA_real_, nrow(Map))))
+  if (all(is.na(reads_depth))) {
+    warning("No FinalReads/TotalReads column - the depth floor is disabled for this run")
+    below_floor <- NULL
+  } else {
+    if ("PropMappability" %in% colnames(Map)) {
+      mapp <- suppressWarnings(as.numeric(Map$PropMappability))
+      reads_depth <- ifelse(is.na(mapp), reads_depth, reads_depth * mapp)
+    }
+    below_floor <- qc_depth_floor(reads_depth, median_frac = depth_floor_median_frac)
+  }
+
+  df_tiers <- qc_assign_tiers(
+    Map,
+    tiers = qc_spec_rna(
+      cutoff_mappability = cutoff_PropMappability,
+      cutoff_exonic = cutoff_PropExonic,
+      cutoff_intergenic = cutoff_PropIntergenic,
+      cutoff_mito = cutoff_ProportionCountsMitochondrialGenes,
+      cutoff_genes = cutoff_ProteinCodingGenesDetected,
+      tight_exonic = tight_PropExonic,
+      tight_mito = tight_ProportionCountsMitochondrialGenes,
+      tight_genes = tight_ProteinCodingGenesDetected,
+      borderline_genes = borderline_ProteinCodingGenesDetected,
+      borderline_mito = borderline_ProportionCountsMitochondrialGenes),
+    below_floor = below_floor,
+    # RNA has no CNV, so no metric is mandatory beyond what the tiers themselves test
+    required_cols = character()
+  )
+
+  df_clust <- data.frame(SampleId = df_tiers$SampleId,
+                         Cluster = df_tiers$TierLabel,
+                         Band = df_tiers$Band,
+                         stringsAsFactors = FALSE)
+
+  #Carry the tier onto the melted expression table so the heatmap facets by it
   melted$Cluster <- match(melted$SampleId,df_clust$SampleId) %>% df_clust$Cluster[.]
-  melted$Cluster <- melted$Cluster %>% factor(levels = c("5","4","3","2","1","0"))
   
   
   p2 <- ggplot(data = melted,aes(Gene,SampleId)) +
@@ -518,21 +601,34 @@ plot_qc_rna <- function(matrix_file = NULL,
   
   
 
-  merged <- Mat %>% as.data.frame   %>% 
-    tibble::rownames_to_column() %>% 
-    dplyr::rename(.data =.,SampleId = rowname,
-                  Verdict_PropMappability = V1,
-                  Verdict_PropExonic = V2,
-                  Verdict_PropIntergenic = V3,
-                  Verdict_ProportionCountsMitochondrialGenes  = V4,
-                  Verdict_ProteinCodingGenesDetected  = V5) %>%
-    merge(df_clust,.,by = "SampleId") %>%
-    dplyr::rename(.data =.,CompositeScore = Cluster)
+  #Return the per-cell verdict.
+  #`CompositeScore` is retained as the numeric 1-5 tier so downstream consumers and the
+  #published RNA-QC_ConsensusScores.txt keep a stable column name; QC_Band is the
+  #Pass/Borderline/Fail collapse and BlockingMetric says which condition held each cell back.
+  merged <- df_tiers %>%
+    dplyr::transmute(SampleId = as.character(SampleId),
+                     CompositeScore = Tier,
+                     QC_Label = as.character(TierLabel),
+                     QC_Band = as.character(Band),
+                     BlockingMetric = BlockingMetric) %>%
+    merge(Map %>% dplyr::mutate(.data =.,SampleId = as.character(SampleId)) %>%
+            dplyr::select(dplyr::any_of(
+              c("SampleId","PropMappability","PropExonic","PropIntergenic",
+                "ProportionCountsMitochondrialGenes","ProteinCodingGenesDetected",
+                "TotalReads","FinalReads"))) %>% unique,
+          by = "SampleId", all.x = TRUE) %>%
+    dplyr::arrange(.data =., dplyr::desc(CompositeScore), SampleId)
   
   
-  #Create a table summarizing how many fall per group 
-  df_sum_cat <- merged$CompositeScore %>% table %>% data.frame %>%
+  #Cells per tier, and per Pass/Borderline/Fail band
+  df_sum_cat <- merged$QC_Label %>% factor(levels = QC_TIER_ORDER) %>%
+    table %>% data.frame %>%
     dplyr::rename(.data =.,Category = ".",NumberCells = Freq) %>%
+    dplyr::mutate(.data =.,ProportionCells = ((NumberCells/sum(NumberCells))*100) %>% round(2))
+  
+  df_sum_band <- merged$QC_Band %>% factor(levels = QC_BAND_ORDER) %>%
+    table %>% data.frame %>%
+    dplyr::rename(.data =.,Band = ".",NumberCells = Freq) %>%
     dplyr::mutate(.data =.,ProportionCells = ((NumberCells/sum(NumberCells))*100) %>% round(2))
   
   # Always add Group column and generate group summary since we now always have a group column
@@ -546,6 +642,7 @@ plot_qc_rna <- function(matrix_file = NULL,
 
   return(list(df_verdict = merged,
               df_sum_verdict = df_sum_cat,
+              df_sum_band = df_sum_band,
               df_sum_verdict_group = df_sum_cat_group,
               composition = composition))
   
@@ -577,6 +674,12 @@ res <- plot_qc_rna(matrix_file = matrix_file,
                    cutoff_PropIntergenic = 0.1,
                    cutoff_ProportionCountsMitochondrialGenes = 0.1,
                    cutoff_ProteinCodingGenesDetected = 500,
+                   tight_PropExonic = 0.8,
+                   tight_ProportionCountsMitochondrialGenes = 0.05,
+                   tight_ProteinCodingGenesDetected = 2000,
+                   borderline_ProteinCodingGenesDetected = 250,
+                   borderline_ProportionCountsMitochondrialGenes = 0.2,
+                   depth_floor_median_frac = 0.5,
                    size_labels_samples = 1,
                    relative_size_heatmap = 1,
                    relative_size_mappability = 0.2,
@@ -605,6 +708,13 @@ write.table(res$df_verdict, "RNA-QC_ConsensusScores.txt", sep = "\t", quote = FA
 
 write.table(res$df_sum_verdict,
             file = "summary_verdict.txt",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE,
+            col.names = TRUE)
+
+write.table(res$df_sum_band,
+            file = "RNA-QC_QCBand_SummaryTable_mqc.txt",
             sep = "\t",
             quote = FALSE,
             row.names = FALSE,

@@ -522,6 +522,60 @@ process QUALIMAP_BAMRNA {
 }
 
 // ============================================================================
+// PROCESS: GENE_BODY_COVERAGE_RNA
+// Description: Per-sample transcript body coverage over housekeeping genes (RSeQC).
+//              Reused from the scrnaseq pipeline (geneBodyCoverageIsai.py, byte-identical).
+//              Emits the per-percentile coverage table df_sum_<sample>.geneBodyCoverage.tsv,
+//              from which RNA_QC_PLOTS derives RatioTranscriptBody / RangeTranscriptBody /
+//              MedianCoverageTranscriptBody. Plots are intentionally not consumed.
+// ============================================================================
+process GENE_BODY_COVERAGE_RNA {
+    tag "${sample_name}"
+
+    input:
+    tuple val(sample_name), path(bam), path(bai)
+    path(reference_bed)
+
+    output:
+    path("df_*.tsv"), emit: df
+
+    script:
+    """
+    geneBodyCoverageIsai.py -r ${reference_bed} -i .
+
+    mv df_sum.geneBodyCoverage.tsv df_sum_${sample_name}.geneBodyCoverage.tsv
+    mv df_all.genebodypercentile.tsv df_all_${sample_name}.genebodypercentile.tsv
+    mv df_skewness.genebodypercentile.tsv df_skewness_${sample_name}.genebodypercentile.tsv
+    """
+}
+
+// ============================================================================
+// PROCESS: GENE_BODY_COVERAGE_RNA_PLOT
+// Description: Aggregate transcript body coverage line plot across all samples
+//              (one line per sample, normalized coverage over the 100 percentiles).
+//              Reused from the scrnaseq pipeline (geneBodyCoveragePlot.py). The
+//              "_mqc.png" output is auto-embedded by MultiQC.
+// ============================================================================
+process GENE_BODY_COVERAGE_RNA_PLOT {
+    tag "gene_body_coverage_plot"
+
+    input:
+    path(df_files)
+
+    output:
+    path("transcript_body_coverage_mqc.png"), emit: gene_body_png
+
+    script:
+    """
+    # Concatenate the per-sample df_sum tables into one df_all.tsv (single header
+    # row + one coverage row per sample), then render the aggregate plot.
+    cat df_sum* | grep Percentile | head -n1 > header
+    cat df_sum* | grep -v Percentile | cat header - > df_all.tsv
+    geneBodyCoveragePlot.py
+    """
+}
+
+// ============================================================================
 // PROCESS: CREATE_QC_REPORT
 // Description: Parse Qualimap output to extract genomic proportion metrics
 // ============================================================================
@@ -530,6 +584,7 @@ process CREATE_QC_REPORT {
 
     input:
     path(qualimap_outdirs)
+    path(bias_fixer)
 
     output:
     path("qualimap_stats_mqc.csv"), emit: stats
@@ -538,6 +593,14 @@ process CREATE_QC_REPORT {
     """
     echo "Working on Qualimap output directories"
     Rscript /usr/local/bin/parse_qualimap.R
+
+    # parse_qualimap.R mis-parses the 3' and 5'-3' bias columns: its unanchored
+    # grep also matches the "5'-3' bias region size = 100" header line, so both
+    # columns end up as the constant 100. Re-extract the real values from each
+    # rnaseq_qc_results.txt and overwrite only those three columns. Done here in
+    # pipeline code to avoid a container rebuild and keep parse_qualimap.R
+    # byte-identical to its source copy.
+    Rscript ${bias_fixer}
     """
 }
 
@@ -585,6 +648,7 @@ process RNA_QC_PLOTS {
     tuple path(gene_counts_tsv), path(gene_types_tsv), path(mt_counts_tsv)
     path(matrix_file)
     path(metadata_file)
+    path(gene_body_files)
     path(input_csv)
     val(dataset_id)
     val(workspace)
@@ -928,6 +992,14 @@ qualimap_df['prop_mappability'] = (
     (qualimap_df['reads aligned'] + qualimap_df['not aligned'])
 )
 
+# Carry the three Qualimap transcript-coverage-bias metrics through unchanged.
+# CSV headers keep the raw Qualimap spelling (spaces + apostrophes), same pattern
+# as the 'bam file' lookup above. to_numeric(errors='coerce') turns blank/NA/
+# non-numeric cells into NaN -> null in the parquet.
+_bias_src = {"5' bias": 'bias_5prime', "3' bias": 'bias_3prime', "5'-3' bias": 'bias_5prime_3prime'}
+for _src, _dst in _bias_src.items():
+    qualimap_df[_dst] = pd.to_numeric(qualimap_df[_src], errors='coerce') if _src in qualimap_df.columns else pd.NA
+
 # Read the combined metrics CSV to get MT% for each sample
 metrics_df = pd.read_csv('combined_selected_metrics.csv')
 
@@ -1003,7 +1075,8 @@ print(f"  PropIntergenic range: {qualimap_df['prop_intergenic'].min():.3f}-{qual
 print(f"  ProportionCountsMitochondrialGenes range: {qualimap_df['prop_mt'].min():.3f}-{qualimap_df['prop_mt'].max():.3f}")
 
 # Write qualimap proportions for merging into parquet schema
-qualimap_df[['biosampleName', 'prop_mappability', 'prop_exonic', 'prop_intergenic', 'prop_intronic']].rename(
+qualimap_df[['biosampleName', 'prop_mappability', 'prop_exonic', 'prop_intergenic', 'prop_intronic',
+             'bias_5prime', 'bias_3prime', 'bias_5prime_3prime']].rename(
     columns={'biosampleName': 'biosample'}
 ).to_csv('qualimap_proportions.tsv', sep='\t', index=False)
 print(f"✓ Wrote qualimap_proportions.tsv with {len(qualimap_df)} samples")
@@ -1055,11 +1128,58 @@ if os.path.exists('qualimap_proportions.tsv'):
             'prop_exonic':      row['prop_exonic'],
             'prop_intergenic':  row['prop_intergenic'],
             'prop_intronic':    row['prop_intronic'],
+            'bias_5prime':        row['bias_5prime'],
+            'bias_3prime':        row['bias_3prime'],
+            'bias_5prime_3prime': row['bias_5prime_3prime'],
         }
+
+# ========== Gene body coverage metrics ==========
+# Ported verbatim from create_master_stats_scrnaseqwf.R (the scrnaseq pipeline) so
+# users see the same RatioTranscriptBody / RangeTranscriptBody /
+# MedianCoverageTranscriptBody they know. Each df_sum_<sample>.geneBodyCoverage.tsv
+# has one data row: [SampleId, cov_1 .. cov_100]. The R indices below are 1-based
+# inclusive; the Python slices are the 0-based equivalents (x[10:49] -> x[9:49],
+# x[51:90] -> x[50:90], y[10:30] -> y[9:30], y[40:60] -> y[39:60], y[70:90] -> y[69:90]).
+import warnings
+import numpy as np
+
+def _finite_or_none(v):
+    # Keep only genuine finite numbers; nan/inf (e.g. all-NaN slice, or a 0/0
+    # division) collapse to None so "nan" never leaks into the parquet or the
+    # RangeTranscriptBody string.
+    return float(v) if v is not None and np.isfinite(v) else None
+
+gene_body = {}
+for gf in glob.glob("df_sum_*.geneBodyCoverage.tsv"):
+    sample_gb = gf[len("df_sum_"):-len(".geneBodyCoverage.tsv")]
+    try:
+        gdf = pd.read_csv(gf, sep="\t")
+        x = pd.to_numeric(gdf.iloc[0, 1:], errors="coerce").to_numpy(dtype="float64")
+        if x.size == 0 or np.all(np.isnan(x)):
+            continue
+        # nan-aware reductions so a stray missing percentile doesn't void the whole
+        # metric; the finiteness guard then turns any all-NaN slice / 0-division into None.
+        with warnings.catch_warnings(), np.errstate(invalid="ignore", divide="ignore"):
+            warnings.simplefilter("ignore", RuntimeWarning)
+            ratio = _finite_or_none(np.nanmean(x[9:49]) / np.nanmean(x[50:90]))
+            rng = np.nanmax(x) - np.nanmin(x)
+            y = (x - np.nanmin(x)) / rng if (np.isfinite(rng) and rng != 0) else np.full_like(x, np.nan)
+            a = _finite_or_none(np.nanmedian(y[9:30]))
+            b = _finite_or_none(np.nanmedian(y[39:60]))
+            c = _finite_or_none(np.nanmedian(y[69:90]))
+            median_y = _finite_or_none(np.nanmedian(y))
+        range_str = f"{round(a, 2)}-{round(b, 2)}-{round(c, 2)}" if None not in (a, b, c) else None
+        gene_body[sample_gb] = {
+            'RatioTranscriptBody':          ratio,
+            'RangeTranscriptBody':          range_str,
+            'MedianCoverageTranscriptBody': median_y,
+        }
+    except Exception as e:
+        print(f"Warning: could not compute gene body metrics for {sample_gb}: {e}")
 
 # ========== Schema column lists ==========
 _str_cols    = ['biosample','dataset_id','pipeline','pipeline_version','molecule_type',
-                'qc_status','workspace','workflow_id','user']
+                'qc_status','workspace','workflow_id','user','RangeTranscriptBody']
 _double_cols = ['fastp_q20_rate','fastp_q30_rate','fastp_gc_content','fastp_q30_rate_after',
                 'fastp_duplication_rate','star_uniquely_mapped_pct','star_avg_mapped_length',
                 'star_mismatch_rate','star_deletion_rate','star_deletion_avg_length',
@@ -1068,7 +1188,9 @@ _double_cols = ['fastp_q20_rate','fastp_q30_rate','fastp_gc_content','fastp_q30_
                 'star_unmapped_other_pct','star_chimeric_pct','mt_pct',
                 'htseq_assigned_pct','htseq_no_feature_pct','htseq_ambiguous_pct',
                 'htseq_alignment_not_unique_pct',
-                'prop_mappability','prop_exonic','prop_intergenic','prop_intronic','rrna_pct']
+                'prop_mappability','prop_exonic','prop_intergenic','prop_intronic','rrna_pct',
+                'bias_5prime','bias_3prime','bias_5prime_3prime',
+                'RatioTranscriptBody','MedianCoverageTranscriptBody']
 _bigint_cols = ['total_reads','final_reads','fastp_total_reads','fastp_total_bases',
                 'fastp_read1_mean_length','fastp_read2_mean_length','fastp_reads_after_filter',
                 'fastp_adapter_trimmed_reads','fastp_adapter_trimmed_bases',
@@ -1112,6 +1234,18 @@ for jf in json_files:
         summary.setdefault('prop_exonic',      None)
         summary.setdefault('prop_intergenic',  None)
         summary.setdefault('prop_intronic',    None)
+        summary.setdefault('bias_5prime',        None)
+        summary.setdefault('bias_3prime',        None)
+        summary.setdefault('bias_5prime_3prime', None)
+
+    # Merge gene body coverage metrics (null when gene body coverage was skipped
+    # or produced no table for this sample — keeps the parquet schema stable).
+    if sample in gene_body:
+        summary.update(gene_body[sample])
+    else:
+        summary.setdefault('RatioTranscriptBody',          None)
+        summary.setdefault('RangeTranscriptBody',          None)
+        summary.setdefault('MedianCoverageTranscriptBody', None)
 
     # Write parquet
     df = pd.DataFrame([summary])
@@ -1144,6 +1278,22 @@ for jf in json_files:
     prop_exo_str  = f"{prop_exo:.4f}"  if prop_exo  is not None else "NA"
     prop_int_str  = f"{prop_int:.4f}"  if prop_int  is not None else "NA"
     prop_intr_str = f"{prop_intr:.4f}" if prop_intr is not None else "NA"
+    # Qualimap transcript-coverage-bias metrics. pd.notna() (not `is not None`):
+    # a blank / NA CSV cell arrives as float('nan'), and f"{nan:.2f}" would render
+    # the literal string "nan" instead of "NA".
+    _b5  = summary.get('bias_5prime')
+    _b3  = summary.get('bias_3prime')
+    _b53 = summary.get('bias_5prime_3prime')
+    _b5_str  = f"{_b5:.2f}"  if pd.notna(_b5)  else "NA"
+    _b3_str  = f"{_b3:.2f}"  if pd.notna(_b3)  else "NA"
+    _b53_str = f"{_b53:.2f}" if pd.notna(_b53) else "NA"
+    # Gene body coverage metrics (scrnaseq names). Range is a formatted string.
+    _gb_ratio  = summary.get('RatioTranscriptBody')
+    _gb_median = summary.get('MedianCoverageTranscriptBody')
+    _gb_range  = summary.get('RangeTranscriptBody')
+    _gb_ratio_str  = f"{_gb_ratio:.2f}"  if pd.notna(_gb_ratio)  else "NA"
+    _gb_median_str = f"{_gb_median:.4f}" if pd.notna(_gb_median) else "NA"
+    _gb_range_str  = _gb_range if isinstance(_gb_range, str) else "NA"
     with open(f"{sample}_selected_metrics_mqc.txt", 'w') as fh:
         fh.write("# id: 'rnaqc_summary'\\n")
         fh.write("# plot_type: 'table'\\n")
@@ -1151,10 +1301,13 @@ for jf in json_files:
         fh.write("# description: 'Per-sample alignment, expression, and genomic composition QC metrics with pass/fail status.'\\n")
         fh.write("# pconfig:\\n")
         fh.write("#   id: 'rnaqc_summary_table'\\n")
-        fh.write("sample_name\\tQC_Status\\tScore\\tPropMappability\\tPropExonic\\tPropIntergenic\\tPropIntronic\\tMT_pct\\tPropRibosomal\\tProteinCodingGenes\\tTotalReads\\tFinalReads\\tfastp_q30_rate\\tPCT_Filtered\\tPCT_Low_Quality\\tPCT_Too_Short\\n")
+        fh.write("sample_name\\tQC_Status\\tScore\\tPropMappability\\tPropExonic\\tPropIntergenic\\tPropIntronic\\tBias5Prime\\tBias3Prime\\tBias5Prime3Prime\\tMT_pct\\tPropRibosomal\\tRatioTranscriptBody\\tRangeTranscriptBody\\tMedianCoverageTranscriptBody\\tProteinCodingGenes\\tTotalReads\\tFinalReads\\tfastp_q30_rate\\tPCT_Filtered\\tPCT_Low_Quality\\tPCT_Too_Short\\n")
         fh.write(f"{sample}\\t{qc_status}\\t{score_str}\\t")
         fh.write(f"{prop_map_str}\\t{prop_exo_str}\\t{prop_int_str}\\t{prop_intr_str}\\t")
-        fh.write(f"{summary.get('mt_pct', 0):.4f}\\t{summary.get('rrna_pct', 0):.4f}\\t{summary.get('genes_protein_coding', 0)}\\t")
+        fh.write(f"{_b5_str}\\t{_b3_str}\\t{_b53_str}\\t")
+        fh.write(f"{summary.get('mt_pct', 0):.4f}\\t{summary.get('rrna_pct', 0):.4f}\\t")
+        fh.write(f"{_gb_ratio_str}\\t{_gb_range_str}\\t{_gb_median_str}\\t")
+        fh.write(f"{summary.get('genes_protein_coding', 0)}\\t")
         fh.write(f"{summary.get('total_reads', 0)}\\t{summary.get('final_reads', 0)}\\t")
         fh.write(f"{summary.get('fastp_q30_rate', 0):.4f}\\t")
         fh.write(f"{summary.get('fastp_pct_filtered', 0):.4f}\\t")
@@ -1278,6 +1431,21 @@ custom_data:
         description: "Proportion of mapped reads falling in intronic regions (0-1). Source: Qualimap."
         format: "{:.4f}"
         placement: 195
+      Bias5Prime:
+        title: "5' Bias"
+        description: "Qualimap transcript coverage bias at the 5' end (ratio). Source: Qualimap rnaseq."
+        format: "{:.2f}"
+        placement: 142
+      Bias3Prime:
+        title: "3' Bias"
+        description: "Qualimap transcript coverage bias at the 3' end (ratio). Source: Qualimap rnaseq."
+        format: "{:.2f}"
+        placement: 144
+      Bias5Prime3Prime:
+        title: "5'-3' Bias"
+        description: "Qualimap ratio of 5' to 3' transcript coverage bias. Source: Qualimap rnaseq."
+        format: "{:.2f}"
+        placement: 146
       MT_pct:
         title: "Proportion Mitochondrial"
         description: "Proportion of reads mapping to the mitochondrial genome (0-1)."
@@ -1288,6 +1456,20 @@ custom_data:
         description: "Proportion of assigned counts from ribosomal RNA genes (rRNA + Mt_rRNA biotypes) (0-1). Source: HTSeq gene-biotype counts."
         format: "{:.4f}"
         placement: 155
+      RatioTranscriptBody:
+        title: "Ratio Transcript Body"
+        description: "Ratio of mean coverage over the 5' half vs the 3' half of the transcript body (percentiles 10-49 / 51-90). Source: RSeQC gene body coverage."
+        format: "{:.2f}"
+        placement: 156
+      RangeTranscriptBody:
+        title: "Range Transcript Body"
+        description: "Median normalized coverage over the 5' / mid / 3' regions of the transcript body, formatted as a-b-c. Source: RSeQC gene body coverage."
+        placement: 157
+      MedianCoverageTranscriptBody:
+        title: "Median Coverage Transcript Body"
+        description: "Median of the min-max normalized transcript body coverage across the 100 percentiles (0-1). Source: RSeQC gene body coverage."
+        format: "{:.4f}"
+        placement: 158
       ProteinCodingGenes:
         title: "Protein Coding Genes"
         description: "Number of protein-coding genes detected (count > 0). Source: DESeq2/featureCounts."
@@ -1475,6 +1657,26 @@ workflow {
     QUALIMAP_BAMRNA(SAMTOOLS_INDEX_FILTER.out.bam_bai, file(params.gtf, checkIfExists: true))
     HTSEQ_COUNTS(SAMTOOLS_INDEX_FILTER.out.bam_bai, file(params.gtf, checkIfExists: true))
 
+    // ========== Gene body coverage (transcript body coverage metrics) ==========
+    // Runs per sample on the zero-read-filtered BAMs (Illumina + Ultima alike).
+    // Guarded so it degrades gracefully when disabled or when the genome has no
+    // housekeeping-gene bed (genebody_ref is only defined for GRCh38 / GRCm39).
+    ch_gene_body = Channel.value([])
+    ch_gene_body_plot = Channel.empty()
+    if (!params.skip_gene_body_coverage && params.genebody_ref) {
+        GENE_BODY_COVERAGE_RNA(
+            SAMTOOLS_INDEX_FILTER.out.bam_bai,
+            file(params.genebody_ref, checkIfExists: true)
+        )
+        ch_gene_body = GENE_BODY_COVERAGE_RNA.out.df.collect()
+
+        // Aggregate transcript body coverage plot across all samples (for MultiQC)
+        GENE_BODY_COVERAGE_RNA_PLOT(ch_gene_body)
+        ch_gene_body_plot = GENE_BODY_COVERAGE_RNA_PLOT.out.gene_body_png
+    } else {
+        log.warn "Skipping gene body coverage (skip_gene_body_coverage=${params.skip_gene_body_coverage}, genebody_ref=${params.genebody_ref})"
+    }
+
     // ========== HTSeq Processing ==========
     CREATE_HTSEQ_SUMMARY(
         HTSEQ_COUNTS.out.htseq_counts,
@@ -1501,7 +1703,10 @@ workflow {
     PLOTTER_PCAHEATMAP(MERGE_HTSEQ_SUMMARY.out.merge_tsv)
 
     // Parse Qualimap outputs to extract genomic proportion metrics
-    CREATE_QC_REPORT(QUALIMAP_BAMRNA.out.outdir.collect())
+    CREATE_QC_REPORT(
+        QUALIMAP_BAMRNA.out.outdir.collect(),
+        file("${projectDir}/assets/fix_qualimap_bias.R", checkIfExists: true)
+    )
 
     // ========== Consolidated RNA QC + Parquet Generation ==========
     RNA_QC_PLOTS(
@@ -1512,6 +1717,7 @@ workflow {
         MERGE_HTSEQ_SUMMARY.out.merge_tsv,
         CREATE_HTSEQ_MATRIX.out.htseq_matrix,
         CREATE_QC_REPORT.out.stats,
+        ch_gene_body,
         file(params.input_csv, checkIfExists: true),
         params.dataset_id,
         params.workspace,
@@ -1534,6 +1740,7 @@ workflow {
         .mix(CREATE_HTSEQ_MATRIX.out.housekeeping_genes_counts)
         .mix(CREATE_HTSEQ_MATRIX.out.housekeeping_genes_clustergram)
         .mix(RNA_QC_PLOTS.out.summary_verdict)
+        .mix(ch_gene_body_plot)
         .collect()
 
     MULTIQC(
@@ -1566,12 +1773,19 @@ workflow {
     // Full-schema TSV of all samples for nf-test validation
     rnaqc_summary_tsv = RNA_QC_PLOTS.out.summary_tsv
 
+    // Raw Qualimap metrics table, including the transcript-coverage-bias columns
+    qualimap_stats = CREATE_QC_REPORT.out.stats
+
+    // Per-sample gene body coverage tables (the per-percentile data behind the plots)
+    gene_body_coverage = ch_gene_body
+
     rnaqc_plots = channel.empty()
         .mix(RNA_QC_PLOTS.out.composition_pdf)
         .mix(RNA_QC_PLOTS.out.composition_jpg)
         .mix(RNA_QC_PLOTS.out.consensus_scores)
         .mix(RNA_QC_PLOTS.out.summary_verdict)
         .mix(RNA_QC_PLOTS.out.summary_verdict_group)
+        .mix(ch_gene_body_plot)
         .collect()
 
     per_biosample_status = RNA_QC_PLOTS.out.per_biosample_status
@@ -1649,6 +1863,28 @@ output {
              pipeline: workflow.manifest.name,
              molecule_type: "rna",
              artifact: "rnaqc_summary_tsv"
+    }
+
+    // Raw Qualimap metrics table (carries the 5'/3'/5'-3' bias columns)
+    qualimap_stats {
+        path "workflow_outputs/${params.workspace}/${params.workflow_id}/metrics/rnaqc_metrics"
+        tags workspace: params.workspace,
+             dataset_id: params.dataset_id,
+             workflow_id: params.workflow_id,
+             pipeline: workflow.manifest.name,
+             molecule_type: "rna",
+             artifact: "qualimap_stats"
+    }
+
+    // Per-sample gene body coverage tables (df_sum / df_all / df_skewness)
+    gene_body_coverage {
+        path "workflow_outputs/${params.workspace}/${params.workflow_id}/metrics/gene_body_coverage"
+        tags workspace: params.workspace,
+             dataset_id: params.dataset_id,
+             workflow_id: params.workflow_id,
+             pipeline: workflow.manifest.name,
+             molecule_type: "rna",
+             artifact: "gene_body_coverage"
     }
 
     rnaqc_plots {
