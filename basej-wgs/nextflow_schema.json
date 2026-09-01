@@ -19,6 +19,9 @@
 
         "mode":                        { "$ref": "#/definitions/pipeline_mode_options/properties/mode" },
         "exome_panel":                 { "$ref": "#/definitions/pipeline_mode_options/properties/exome_panel" },
+        "analysis_mode":               { "$ref": "#/definitions/pipeline_mode_options/properties/analysis_mode" },
+        "bulk_split_reads":            { "$ref": "#/definitions/pipeline_mode_options/properties/bulk_split_reads" },
+        "bulk_coverage_cap":           { "$ref": "#/definitions/pipeline_mode_options/properties/bulk_coverage_cap" },
 
         "skip_subsampling":            { "$ref": "#/definitions/read_processing_options/properties/skip_subsampling" },
         "max_total_reads":             { "$ref": "#/definitions/read_processing_options/properties/max_total_reads" },
@@ -165,6 +168,34 @@
                         "Twist Alliance CNTG Hereditary Oncology Panel"
                     ],
                     "default": "xGen Exome Hyb Panel v2"
+                },
+                "analysis_mode": {
+                    "type": "string",
+                    "description": "Sample type: 'single_cell' (default) or 'bulk' for deep bulk libraries such as 200x WGS.",
+                    "help_text": "'single_cell' is the default and unchanged: one alignment task per biosample, capped at max_total_reads (1B reads). 'bulk' does NOT subsample - each FASTQ unit is split into bulk_split_reads-sized parts, the parts are aligned in parallel, then merged, duplicate-MARKED (not removed) and measured in a single task. Bulk mode requires FASTQ input (CRAM is rejected), requires pipeline_tool='sentieon', is mutually exclusive with coverage_target, and produces alignment + QC only (no CNV or variant calling). Multi-lane input is not cat'ed together in bulk mode: each lane is aligned as its own unit and lanes regroup at the duplicate-marking step.",
+                    "fa_icon": "fas fa-layer-group",
+                    "enum": ["single_cell", "bulk"],
+                    "default": "single_cell",
+                    "x-cost-impact": "high",
+                    "x-agent-hint": "Use analysis_mode='bulk' only for deep bulk FASTQ libraries (e.g. 200x WGS) on the Sentieon path. It is orthogonal to `mode` (wgs|exome)."
+                },
+                "bulk_split_reads": {
+                    "type": "integer",
+                    "description": "Reads per split part in bulk mode, counted across both mates.",
+                    "help_text": "Only used when analysis_mode='bulk'. Each FASTQ unit is split into parts of this many reads (sum of both mates, the same convention as max_total_reads), so a 200x 2x150 WGS library of ~4.1B reads yields 4-5 parts that align in parallel. Smaller values increase parallelism and per-shard cost; the merge/duplicate-marking task is unaffected because it always sees the whole biosample.",
+                    "fa_icon": "fas fa-cut",
+                    "default": 1000000000,
+                    "minimum": 2,
+                    "hidden": true
+                },
+                "bulk_coverage_cap": {
+                    "type": "integer",
+                    "description": "Depth histogram cap for WgsMetricsAlgo in bulk mode.",
+                    "help_text": "Only used when analysis_mode='bulk' with mode='wgs'. Passed as --coverage_cap to Sentieon WgsMetricsAlgo. The Picard-derived default of 250 truncates the depth histogram of a 200x library, which depresses mean_coverage and inflates pct_exc_capped, so bulk runs raise it. Single-cell metrics are unaffected.",
+                    "fa_icon": "fas fa-arrows-alt-v",
+                    "default": 1000,
+                    "minimum": 1,
+                    "hidden": true
                 }
             }
         },
