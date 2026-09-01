@@ -1,10 +1,14 @@
 # custom_r_qcplots container
 # Provides: R 4.5.x with extensive package set (ohchibi, ggpubr, dplyr, etc.)
 #           plus Python 3 with pyarrow for Parquet output
-# Tag: custom_r_qcplots_0.2.1
+# Scripts: dna_qc_plot.R, methyl_qc_plot.R, rna_qc_plot.R, wgs_qc_plot.R, wes_qc_plot.R,
+#          cnvSummarizer.R, function_cnv_quadrants_qc.R, htseq_summarydf_to_matrix.R,
+#          qc_scoring.R + qc_scoring_specs.R (shared 1-5 tier scoring - required by every
+#          plot script, which sources it from /usr/local/bin)
+# Tag: custom_r_qcplots_0.3.0
 #
 # Build:
-#   docker build -t basejumper_custom_r_qcplots_0.2.1 .
+#   docker build -t basejumper_custom_r_qcplots_0.3.0 .
 #
 # Note: This is a full rebuild Dockerfile. Build time is significant (~30-45 min)
 # due to R package compilation.

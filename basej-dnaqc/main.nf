@@ -1103,13 +1103,13 @@ PYEOF
 
     echo ""
     echo "Step 6: Generating QC composition plots..."
-    Rscript /usr/local/bin/function_plot_qc_dna.R \\
+    Rscript /usr/local/bin/dna_qc_plot.R \\
         --seg_copy_file ${seg_copy_file} \\
         --metrics_file nf-preseq-pipeline_all_metrics_mqc_withcnv.txt \\
         --metadata_file ${metadata_file} \\
         --cnv_summary_file AllSample-GinkgoSegmentSummary.txt \\
         --plot_qc_config ${plot_qc_config}
-    echo "  ✓ Finished function_plot_qc_dna.R"
+    echo "  ✓ Finished dna_qc_plot.R"
 
     echo ""
     echo "Step 7: Generating CNV quadrants plot..."
