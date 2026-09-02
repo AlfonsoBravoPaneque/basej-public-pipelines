@@ -15,7 +15,7 @@ Each Dockerfile builds to a local tag of the form `basejumper_<tag>` (e.g.
 | `ubuntu/` | `basejumper_ubuntu_24.04_stable` | MERGE_MULTILANE_FASTQ | Minimal ubuntu for cat-based merge |
 | `seqkit/` | `basejumper_seqkit-2.13.0` | SEQKIT_SAMPLE | Read subsampling |
 | `custom_r_nf_rnaseq/` | `basejumper_custom_r_nf_rnaseq_0.10` | CREATE_QC_REPORT, CREATE_HTSEQ_SUMMARY, MERGE_HTSEQ_SUMMARY, PLOTTER_PCAHEATMAP | R + Bioconductor for gene annotation/parsing and PCA/heatmap |
-| `custom_r_qcplots/` | `basejumper_custom_r_qcplots_0.2.3` | RNA_QC_PLOTS, CREATE_HTSEQ_MATRIX | R + Python for QC scoring, Parquet, composition plots |
+| `custom_r_qcplots/` | `basejumper_custom_r_qcplots_0.3.0` | RNA_QC_PLOTS, CREATE_HTSEQ_MATRIX | R + Python for QC scoring, Parquet, composition plots |
 | `gene_body_coverage/` | `basejumper_gene_body_coverage_0.2.1` | GENE_BODY_COVERAGE_RNA, GENE_BODY_COVERAGE_RNA_PLOT | Python + RSeQC for gene body coverage analysis |
 
 ## Public biocontainers (no Dockerfile needed)
@@ -51,7 +51,7 @@ For example:
 
 ```bash
 docker build -t basejumper_custom_r_nf_rnaseq_0.10 container/custom_r_nf_rnaseq/
-docker build -t basejumper_custom_r_qcplots_0.2.3 container/custom_r_qcplots/
+docker build -t basejumper_custom_r_qcplots_0.3.0 container/custom_r_qcplots/
 docker build -t basejumper_gene_body_coverage_0.2.1 container/gene_body_coverage/
 ```
 
