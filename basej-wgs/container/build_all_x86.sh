@@ -16,7 +16,7 @@ BUILDS=(
   "bwamem2_samtools_picard:basejumper_bwamem2_samtools_picard_1.0.0"
   "picard_addorreplacegroups:basejumper_picard_addorreplacegroups_3.1.2"
   "custom_parabricks-metrics:basejumper_custom_parabricks-metrics_1.0.3"
-  "custom_r_qcplots:basejumper_custom_r_qcplots_0.2.1"
+  "custom_r_qcplots:basejumper_custom_r_qcplots_0.3.0"
 )
 
 echo "BUILD STARTED: $(date)" | tee -a "$SUMMARY"
