@@ -104,8 +104,8 @@ RUN R -e "remotes::install_version('tidytree', version = '0.4.6', repos = 'https
     R CMD INSTALL /tmp/ggtree
 RUN R -e "library(ggtree); library(treeio); cat('ggtree', as.character(packageVersion('ggtree')), 'treeio', as.character(packageVersion('treeio')), 'tidytree', as.character(packageVersion('tidytree')), 'OK\n')"
 
-RUN R -e  "install.packages('optparse', repos = 'http://cran.us.r-project.org')" 
-RUN R -e  "install.packages('getopt', repos = 'http://cran.us.r-project.org')" 
+RUN R -e  "install.packages('optparse', repos = 'https://cloud.r-project.org')" 
+RUN R -e  "install.packages('getopt', repos = 'https://cloud.r-project.org')" 
 
 RUN apt-get install -y git
 # devtools>=2.4 pulls testthat 3 -> waldo; PPM's diffobj for 2022-06-15 is <0.3.5 so waldo 0.4.0 breaks
@@ -115,16 +115,29 @@ RUN R -e "ppm <- 'https://packagemanager.posit.co/cran/2022-06-15'; options(repo
 
 RUN apt-get install bc
 
-RUN R -e  "install.packages('foreach', repos = 'http://cran.us.r-project.org')"
-RUN R -e  "install.packages('doParallel', repos = 'http://cran.us.r-project.org')"
+RUN R -e  "install.packages('foreach', repos = 'https://cloud.r-project.org')"
+RUN R -e  "install.packages('doParallel', repos = 'https://cloud.r-project.org')"
 
-RUN R -e  "install.packages('pals', repos = 'http://cran.us.r-project.org')"
-RUN R -e  "install.packages('paletteer', repos = 'http://cran.us.r-project.org')"
-RUN R -e  "install.packages('egg', repos = 'http://cran.us.r-project.org')"
-RUN R -e  "install.packages('RColorBrewer', repos = 'http://cran.us.r-project.org')"
-RUN R -e  "install.packages('jsonlite', repos = 'http://cran.us.r-project.org')"
-RUN R -e  "install.packages('png', repos = 'http://cran.us.r-project.org')"
-RUN R -e  "install.packages('hexbin', repos = 'http://cran.us.r-project.org')"
+RUN R -e  "install.packages('pals', repos = 'https://cloud.r-project.org')"
+RUN R -e  "install.packages('paletteer', repos = 'https://cloud.r-project.org')"
+RUN R -e  "install.packages('egg', repos = 'https://cloud.r-project.org')"
+RUN R -e  "install.packages('RColorBrewer', repos = 'https://cloud.r-project.org')"
+RUN R -e  "install.packages('jsonlite', repos = 'https://cloud.r-project.org')"
+RUN R -e  "install.packages('png', repos = 'https://cloud.r-project.org')"
+RUN R -e  "install.packages('hexbin', repos = 'https://cloud.r-project.org')"
+
+# Fail the BUILD if any plain install.packages() above silently no-op'd.
+# R's install.packages() only WARNS on failure and `R -e` still exits 0, so a
+# broken/unreachable mirror produces a green build and an image missing packages.
+# That is exactly how the previously-used http://cran.us.r-project.org mirror
+# (301 -> lib.stat.cmu.edu, now 403) shipped an image without optparse: the
+# phylogeny scripts then hit their runtime `install.packages` fallback, which
+# cannot write to /opt/R/*/lib/R/library as the non-root CI user, and the task
+# died with "unable to install packages". Assert every package loads instead.
+RUN R -e "pkgs <- c('optparse','getopt','foreach','doParallel','pals','paletteer','egg','RColorBrewer','jsonlite','png','hexbin'); \
+    missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]; \
+    if (length(missing)) stop('CRAN packages failed to install: ', paste(missing, collapse = ', ')); \
+    cat('all plain-CRAN packages present OK\n')"
 
 # Later CRAN installs can pull tidytree 0.4.7 and break treeio lazy-load; keep 0.4.6.
 # Pin ggfun to current CRAN (ggplot2 3.5–aware helpers); then re-pin ggplot2/tidytree so nothing drifts.
