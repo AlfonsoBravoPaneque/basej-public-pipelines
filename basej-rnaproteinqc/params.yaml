@@ -1,0 +1,8 @@
+input_csv: "/path/to/input.csv"
+genome: "GRCh38"
+workspace: "demo"
+dataset_id: "test_dataset"
+outputDir: "results"
+# Protein / ADT quantification
+skip_protein_quant: false
+barcode: "s3://bioskryb-shared-data/dev-resources/TotalSeqA-cocktail_barcodes/TotalSeqA-cocktail_barcodes.fa"

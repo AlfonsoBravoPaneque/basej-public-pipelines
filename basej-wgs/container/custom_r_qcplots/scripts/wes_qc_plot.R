@@ -2,15 +2,44 @@ library(ohchibi)
 library(dplyr)
 library(optparse)
 
+# Shared 1-5 tier scoring, and the per-assay threshold specs.
+# Installed to /usr/local/bin in the container; falls back to the script's own directory so
+# the script can be run straight from the repo.
+for (.f in c("qc_scoring.R", "qc_scoring_specs.R")) {
+  .p <- c(file.path("/usr/local/bin", .f), .f)
+  .hit <- .p[file.exists(.p)]
+  if (!length(.hit)) stop(sprintf("%s not found in /usr/local/bin or the working directory", .f))
+  source(.hit[1])
+}
+
 set.seed(130816)
 
 bskb_col<-c("#12284C", "#1082A2","#A0CC2C" , "#DD14D3","#F45D34","#777776", "#FFFFFF")
 
 
+# Established WES gates. There are four, not five, so the previous maximum score was 4; tier 4
+# of the scoring uses exactly these values, so tier >= 4 is the same verdict as the old
+# "all four pass".
 cutoff_num_reads <- 500000
 cutoff_10x <- 0.75
 cutoff_zero_cov <- 0.05
 cutoff_fold_80 <- 5
+
+# Tier 5 (Excellent): tighter capture breadth and uniformity. fold_80_base_penalty is how much
+# extra sequencing 80% of targets would need to reach the mean depth, so it is the uniformity
+# measure that most often separates a usable exome from a good one.
+tight_10x <- 0.90
+tight_zero_cov <- 0.02
+tight_fold_80 <- 3
+
+# Tier 3 (Borderline): usable if capacity allows.
+borderline_reads <- 250000
+borderline_10x <- 0.5
+borderline_fold_80 <- 8
+
+# Fraction of the read target below which the coverage metrics measure depth rather than the
+# capture, so the sample is reported Inconclusive instead of failed.
+depth_floor_frac_of_target <- 0.1
 
 
 plot_qc_wes <- function(metrics_file) {
@@ -31,23 +60,34 @@ order_samples <- mclust_samples$order %>% mclust_samples$labels[.]
 
 df$SampleId <- df$SampleId %>% factor(levels = order_samples)
 
-#Quantify verdict samples
-#### Construct the clustered version of the figures with composite score logic
-Mat <- matrix(data = 0,nrow = nrow(df),ncol = 4)
-rownames(Mat) <- df$SampleId
-Mat[,1][which(df$total_reads >= cutoff_num_reads)] <- 1
-Mat[,2][which(df$pct_target_bases_10x >= cutoff_10x)] <- 1
-Mat[,3][which(df$zero_cvg_targets_pct < cutoff_zero_cov)] <- 1
-Mat[,4][which(df$fold_80_base_penalty < cutoff_fold_80)] <- 1
+#### Assign the 1-5 quality tier (see qc_scoring.R)
+#
+# Replaces the previous count of passed thresholds, under which failures were interchangeable
+# and a sample failing a gate outright still rendered in the second band. A tier requires ALL
+# of its conditions, so a sample cannot rank above its weakest metric. Tier 4 keeps the gate
+# values, so tier >= 4 is identical to the old "all four pass".
+df_tiers <- qc_assign_tiers(
+  df,
+  tiers = qc_spec_wes(cutoff_num_reads = cutoff_num_reads,
+                      cutoff_10x = cutoff_10x,
+                      cutoff_zero_cov = cutoff_zero_cov,
+                      cutoff_fold_80 = cutoff_fold_80,
+                      tight_10x = tight_10x,
+                      tight_zero_cov = tight_zero_cov,
+                      tight_fold_80 = tight_fold_80,
+                      borderline_reads = borderline_reads,
+                      borderline_10x = borderline_10x,
+                      borderline_fold_80 = borderline_fold_80),
+  below_floor = qc_depth_floor(df$total_reads,
+                               min_value = depth_floor_frac_of_target * cutoff_num_reads)
+)
 
-#Create sum and that will become the cluster
-df_clust <- rowSums(Mat) %>% data.frame %>%
-  tibble::rownames_to_column() %>%
-  dplyr::rename(.data =.,SampleId = rowname, Cluster = ".")
+df_clust <- data.frame(SampleId = df_tiers$SampleId,
+                       Cluster = df_tiers$TierLabel,
+                       Band = df_tiers$Band,
+                       stringsAsFactors = FALSE)
 
-df_clust$Cluster <- df_clust$Cluster %>% factor(levels = c("4","3","2","1","0"))
-
-#Append cluster information
+#Append tier information
 
 df$Cluster <- match(df$SampleId,df_clust$SampleId) %>% df_clust$Cluster[.]
 
@@ -279,7 +319,10 @@ melted$variable <- melted$variable %>%
 
 melted$Cluster <- match(melted$SampleId,df$SampleId) %>% df$Cluster[.]
 
-p3 <- ggplot(data = melted %>% subset(Cluster != 0),aes(SampleId,value)) +
+# The previous version excluded score-0 samples (those passing no gate) from this panel. Under
+# the tier scheme there is no tier 0 - the lowest is 1 (Not recommended) - and hiding the
+# failures is precisely what we do not want, so every sample is now shown.
+p3 <- ggplot(data = melted,aes(SampleId,value)) +
   geom_bar(stat = "identity",aes(fill = variable),color = "transparent",width = 1) +
   facet_grid(.~Cluster,space = "free",scales = "free") +
   theme_ohchibi(size_panel_border = 0.3,size_title_text = 10,size_legend_text = 9,size_axis_title.x = 10,size_axis_title.y = 10) +
@@ -322,22 +365,35 @@ title <- cowplot::ggdraw() +
 
 final_plot <- cowplot::plot_grid(title, composition_qc_wes, ncol = 1, rel_heights = c(0.05, 1))
 
-merged <- Mat %>% as.data.frame %>%
-  tibble::rownames_to_column() %>%
-  dplyr::rename(.data =., SampleId = rowname,
-                Verdict_TOTAL_READS = V1,
-                Verdict_PCT_TARGET_BASES_10X = V2,
-                Verdict_ZERO_CVG_TARGETS_PCT = V3,
-                Verdict_FOLD_80_BASE_PENALTY = V4) %>%
-  merge(df_clust, ., by = "SampleId") %>%
-  dplyr::rename(.data =., CompositeScore = Cluster)
+# `CompositeScore` is retained as the numeric 1-5 tier so downstream consumers and the
+# published WES-QC_ConsensusScores.txt keep a stable column name; QC_Band is the
+# Pass/Borderline/Fail collapse and BlockingMetric says which condition held each sample back.
+merged <- df_tiers %>%
+  dplyr::transmute(SampleId = as.character(SampleId),
+                   CompositeScore = Tier,
+                   QC_Label = as.character(TierLabel),
+                   QC_Band = as.character(Band),
+                   BlockingMetric = BlockingMetric) %>%
+  merge(df %>% dplyr::mutate(.data =., SampleId = as.character(SampleId)) %>%
+          dplyr::select(dplyr::any_of(
+            c("SampleId","total_reads","pct_target_bases_10x","zero_cvg_targets_pct",
+              "fold_80_base_penalty"))) %>% unique,
+        by = "SampleId", all.x = TRUE) %>%
+  dplyr::arrange(.data =., dplyr::desc(CompositeScore), SampleId)
 
-df_sum_cat <- merged$CompositeScore %>% table %>% data.frame %>%
+df_sum_cat <- merged$QC_Label %>% factor(levels = QC_TIER_ORDER) %>%
+  table %>% data.frame %>%
   dplyr::rename(.data =., Category = ".", NumberSamples = Freq) %>%
+  dplyr::mutate(.data =., ProportionSamples = ((NumberSamples/sum(NumberSamples))*100) %>% round(2))
+
+df_sum_band <- merged$QC_Band %>% factor(levels = QC_BAND_ORDER) %>%
+  table %>% data.frame %>%
+  dplyr::rename(.data =., Band = ".", NumberSamples = Freq) %>%
   dplyr::mutate(.data =., ProportionSamples = ((NumberSamples/sum(NumberSamples))*100) %>% round(2))
 
 return(list(df_verdict = merged,
             df_sum_verdict = df_sum_cat,
+            df_sum_band = df_sum_band,
             composition = final_plot))
 }
 
@@ -365,4 +421,7 @@ write.table(res$df_verdict, "WES-QC_ConsensusScores.txt",
             sep = "\t", quote = FALSE, row.names = FALSE)
 
 write.table(res$df_sum_verdict, "WES-QC_ConsensusScores_SummaryTable_mqc.txt",
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+write.table(res$df_sum_band, "WES-QC_QCBand_SummaryTable_mqc.txt",
             sep = "\t", quote = FALSE, row.names = FALSE)

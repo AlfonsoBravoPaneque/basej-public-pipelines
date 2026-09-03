@@ -48,15 +48,30 @@ nextflow_pipeline {
                     // final_reads ~498686: n_reads=500000 total reads (R1+R2) kept after seqkit subsampling
                     // Values from chr22-only test reference (genomes_base = test_genomes).
                     // total_reads/final_reads are pre-alignment counts (unchanged by ref);
-                    // qc_status/qc_score reflect chr22-only mapping (Borderline/3).
+                    // qc_status/qc_score reflect chr22-only mapping (FAIL/1). Recalibrated for
+                    // the qc_scoring.R engine in custom_r_qcplots_0.3.0, which requires ALL of a
+                    // tier's conditions; the retired function_plot_qc_dna.R counted passed
+                    // thresholds instead and reported these cells as Borderline/3.
+                    //   preseq_count ~3.7e7 is ~70x below even the tier-3 borderline_preseq gate
+                    //   (2.5e9) because chr22 is ~1.6% of the genome, so no tier is reached; and
+                    //   total_reads (4.1e6) is above cutoff_reads_floor (1e6), so tier 2
+                    //   (Inconclusive) does not apply either. That leaves tier 1 / FAIL.
+                    // Consequence to be aware of: this fixture pins the FAIL path, so it does not
+                    // exercise the scoring engine's pass path. Asserting a meaningful
+                    // PASS/Borderline here would need chr22-scaled cutoffs, which requires making
+                    // the hardcoded assets/plot_qc_config.json path overridable by a param.
+                    // Related: SKEW_CNV is empty and MAPD is ~4e-06 for this fixture - Ginkgo
+                    // cannot derive meaningful segment statistics from a single chromosome, so the
+                    // CNV gates are not genuinely tested here (SKEW_CNV only avoids the
+                    // required_cols "unmeasured" path because QC_PLOTS fills it with 999).
                     // NOTE: the zero-read sample (DNAQC-test1-0reads) is excluded here to keep
                     // the CI test to representative samples. (The earlier CI crash was NOT the
                     // 0-read sample itself but a container bug: binUnsorted/CNVcaller were copied
                     // into the ginkgo image without an execute bit, so Ginkgo failed and its
                     // ifEmpty guards + PublishOp then crashed. Fixed in the ginkgo Dockerfile.)
                     def expected = [
-                        'chr22_testsample1':   [total_reads: 4132446, final_reads: 498686, subsampled: 'True', qc_status: 'Borderline', qc_score: 3],
-                        'chr22_testsample2':   [total_reads: 4132446, final_reads: 498686, subsampled: 'True', qc_status: 'Borderline', qc_score: 3],
+                        'chr22_testsample1':   [total_reads: 4132446, final_reads: 498686, subsampled: 'True', qc_status: 'FAIL', qc_score: 1],
+                        'chr22_testsample2':   [total_reads: 4132446, final_reads: 498686, subsampled: 'True', qc_status: 'FAIL', qc_score: 1],
                     ]
 
                     assert lines.size() - 1 == expected.size() : "Expected ${expected.size()} samples, got ${lines.size() - 1}"

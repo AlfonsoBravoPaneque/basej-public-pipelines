@@ -42,7 +42,15 @@ process MERGE_MULTILANE_FASTQ {
 // Description: Optional subsampling — count reads with zcat + wc,
 //              then if total reads > max_total_reads, seqkit sample -p (no two-pass -2) caps reads.
 //              Paired: R1 then R2 sequentially with same PROPORTION/seed; -j 2.
-//              skip_subsampling=true by default.
+//              skip_subsampling=false by default (see nextflow.config), but the
+//              max_total_reads cap of 1e9 means most libraries pass through uncapped.
+//
+//              The raw pre-subsampling read count is written to
+//              <sample>_read_counts.txt (line 1 = TOTAL_READS, line 2 = FINAL_READS)
+//              in the same 2-line format as SAMTOOLS_SUBSAMPLE_CRAM, so
+//              WGS_QC_METRICS_TO_PARQUET can report `total_reads` as the original
+//              input read count — matching basej-dnaqc/basej-rnaqc and the legacy
+//              nf-wgs-pipeline COUNT_READS_FASTQ definition (R1 records + R2 records).
 // ============================================================================
 process SEQKIT_SAMPLE {
     tag "${sample_name}"
@@ -53,6 +61,7 @@ process SEQKIT_SAMPLE {
 
     output:
     tuple val(sample_name), path("${sample_name}_subsampled_R*.fastq.gz"), emit: reads
+    path("${sample_name}_read_counts.txt"), emit: read_counts_file
 
     script:
     def r1 = reads[0]
@@ -85,6 +94,7 @@ process SEQKIT_SAMPLE {
         cp '${r1}' '${sample_name}_subsampled_R1.fastq.gz' &
         ${copy_r2}
         wait
+        FINAL_READS=\$TOTAL_READS
     else
         echo "Subsampling to \$TARGET total reads with seqkit sample -p -j 2 (R1 then R2, no two-pass)..."
         export PROPORTION=\$(awk -v t="\$TARGET" -v tot="\$TOTAL_READS" 'BEGIN { printf "%.18f", t/tot }')
@@ -94,7 +104,101 @@ process SEQKIT_SAMPLE {
         if [ "${paired}" = "true" ]; then
           test -f '${sample_name}_subsampled_R1.fastq.gz' && test -f '${sample_name}_subsampled_R2.fastq.gz' || { echo "ERROR: subsampling did not produce both mates"; exit 1; }
         fi
+        # Recount both mates so FINAL_READS matches the TOTAL_READS unit (R1+R2).
+        # Only reached when the library actually exceeded max_total_reads (1e9 by
+        # default), so this extra decompression pass is rare.
+        R1_SUB=\$(zcat '${sample_name}_subsampled_R1.fastq.gz' | wc -l | awk '{printf "%.0f", \$1/4}')
+        if [ "${paired}" = "true" ]; then
+            R2_SUB=\$(zcat '${sample_name}_subsampled_R2.fastq.gz' | wc -l | awk '{printf "%.0f", \$1/4}')
+            FINAL_READS=\$((R1_SUB + R2_SUB))
+        else
+            FINAL_READS=\$R1_SUB
+        fi
     fi
+
+    echo "Final reads (all mates): \$FINAL_READS"
+
+    # Raw input read count for WGS_QC_METRICS_TO_PARQUET.
+    # Line 1 = TOTAL_READS (pre-subsampling), line 2 = FINAL_READS (post-subsampling).
+    # Same format as SAMTOOLS_SUBSAMPLE_CRAM / basej-dnaqc / basej-rnaqc.
+    echo "\$TOTAL_READS" > '${sample_name}_read_counts.txt'
+    echo "\$FINAL_READS" >> '${sample_name}_read_counts.txt'
+    """
+}
+
+// ============================================================================
+// PROCESS: SPLIT_FASTQ  (bulk mode only)
+// Description: Split one paired FASTQ unit into fixed-size parts so a deep bulk
+//              library (e.g. 200x WGS ≈ 4 billion reads) can be aligned by N
+//              parallel tasks instead of one very long one. Bulk mode does NOT
+//              subsample — every read is kept, just spread across parts.
+//              `pairs_per_part` is params.bulk_split_reads / 2 because
+//              bulk_split_reads counts reads across BOTH mates (same convention
+//              as max_total_reads), while seqkit -s counts records per file.
+//              seqkit split2 walks R1 and R2 in lockstep, so part_NNN of R1 and
+//              part_NNN of R2 are mates and no pair is ever separated. Mates
+//              staying together is what lets each shard be aligned independently.
+// ============================================================================
+process SPLIT_FASTQ {
+    tag "${unit_id}"
+
+    input:
+    tuple val(sample_name), val(unit_id), path(reads)
+    val(pairs_per_part)
+
+    output:
+    tuple val(sample_name), val(unit_id),
+          path("${unit_id}_part*_R1.fastq.gz"),
+          path("${unit_id}_part*_R2.fastq.gz"), emit: parts
+
+    script:
+    def r1 = reads[0]
+    def r2 = reads[1]
+    """
+    # Stage the mates under fixed names: seqkit derives its output names from the
+    # input basenames, so pinning the input names makes the part names
+    # deterministic no matter how the source FASTQs are named.
+    link_in() { if [ "\$1" != "\$2" ]; then ln -sf "\$1" "\$2"; fi; }
+    link_in '${r1}' bulkin_R1.fastq.gz
+    link_in '${r2}' bulkin_R2.fastq.gz
+
+    # --compress-level 1: the parts are transient inputs to alignment and are
+    # never published, so favour split throughput over compression ratio.
+    seqkit split2 \\
+        -1 bulkin_R1.fastq.gz \\
+        -2 bulkin_R2.fastq.gz \\
+        -s ${pairs_per_part} \\
+        -O parts \\
+        -j ${task.cpus} \\
+        --compress-level 1 \\
+        -f
+
+    # Collect the parts into an array (nullglob so a no-match expands to an empty
+    # array rather than the literal pattern).
+    shopt -s nullglob
+    r1_parts=(parts/bulkin_R1.part_*.fastq.gz)
+
+    # An empty/unreadable library makes seqkit exit 0 having written no parts.
+    # Without this check the process would produce no output files and fail with
+    # Nextflow's generic "missing output file" instead of naming the real cause.
+    if [ \${#r1_parts[@]} -eq 0 ]; then
+        echo "ERROR: seqkit split2 produced no parts for '${unit_id}'. The input FASTQ pair is empty or unreadable:" >&2
+        echo "       R1=${r1}" >&2
+        echo "       R2=${r2}" >&2
+        exit 1
+    fi
+
+    # Rename to {unit_id}_part{NNN}_R{1,2}.fastq.gz. R2 is looked up by the same
+    # part number rather than by position, so a mismatch fails loudly (set -e)
+    # instead of silently pairing the wrong mates.
+    for f in "\${r1_parts[@]}"; do
+        part=\$(basename "\$f" | sed -E 's/.*\\.part_([0-9]+)\\..*/\\1/')
+        mv "\$f" '${unit_id}'_part\${part}_R1.fastq.gz
+        mv "parts/bulkin_R2.part_\${part}.fastq.gz" '${unit_id}'_part\${part}_R2.fastq.gz
+    done
+    rmdir parts 2>/dev/null || true
+
+    echo "Split ${unit_id} into \${#r1_parts[@]} part(s) of up to ${pairs_per_part} read pairs"
     """
 }
 
@@ -258,6 +362,151 @@ process SENTIEON_ALIGN_DEDUP {
 
     rm -f '${sample_name}_sorted.bam' '${sample_name}_sorted.bam.bai' \\
           '${sample_name}.locuscollector_score.gz'
+    """
+}
+
+// ============================================================================
+// PROCESS: SENTIEON_ALIGN_SHARD  (bulk mode only)
+// Description: Align ONE FASTQ shard produced by SPLIT_FASTQ. Alignment only —
+//              no LocusCollector, no Dedup: duplicates can only be identified
+//              once every shard of the biosample is back together, which happens
+//              in SENTIEON_MERGE_DEDUP_METRICS.
+//              All shards of a biosample carry an identical @RG (same ID, SM and
+//              LB), so the merged BAM has a single read group and the downstream
+//              Dedup treats every shard as one library.
+// ============================================================================
+process SENTIEON_ALIGN_SHARD {
+    tag "${shard_id}"
+
+    input:
+    tuple val(sample_name), val(shard_id), path(reads)
+    path fasta_ref
+    val(platform)
+
+    output:
+    tuple val(sample_name), path("${shard_id}.bam"), path("${shard_id}.bam.bai"), emit: bam
+
+    script:
+    def r1 = reads[0]
+    def r2 = reads[1]
+    """
+    set +u
+    export SENTIEON_LICENSE=\$SENTIEON_LICENSE_SERVER
+
+    # pipefail matters more here than in the single-task path: if `bwa mem` dies
+    # mid-stream, `util sort` still sees a clean EOF and writes a VALID but
+    # truncated BAM with exit 0. That shard would then be merged silently, giving
+    # a biosample with missing reads and no error anywhere in the run.
+    set -o pipefail
+
+    export bwt_max_mem=\$([ ${task.memory.toGiga()} -gt 30 ] && echo "30G" || echo "${task.memory.toGiga()}G")
+
+    # LB is set (unlike the single-cell path, which aligns a biosample in one
+    # task) because splitting means a PCR duplicate pair can land in a different
+    # shard from the pair it duplicates. Sentieon Dedup groups duplicate
+    # candidates by library, so a shared LB across shards is what makes those
+    # cross-shard duplicates visible to the merged Dedup step.
+    sentieon bwa mem -M -Y -K 2500000000 \\
+        -R "@RG\\tID:${sample_name}\\tSM:${sample_name}\\tLB:${sample_name}\\tPL:${platform}" \\
+        -t ${task.cpus} '${fasta_ref}/genome.fa' '${r1}' '${r2}' | \\
+        sentieon util sort -r '${fasta_ref}/genome.fa' -o '${shard_id}.bam' -t ${task.cpus} --sam2bam -i -
+
+    samtools index -@ ${task.cpus} '${shard_id}.bam'
+    """
+}
+
+// ============================================================================
+// PROCESS: SENTIEON_MERGE_DEDUP_METRICS  (bulk mode only)
+// Description: Merge every shard of a biosample, mark duplicates, and collect all
+//              QC metrics — in ONE task. Consolidated deliberately: a 200x WGS
+//              BAM is several hundred GB, so splitting these steps across tasks
+//              would mean staging that BAM in and out of S3 two extra times.
+//              `sentieon driver` accepts -i repeatedly and treats the inputs as
+//              though they had been merged into one BAM, so no separate
+//              `samtools merge` pass (and no extra full copy of the BAM) is
+//              needed for LocusCollector/Dedup.
+//              Dedup runs WITHOUT --rmdup: duplicates are MARKED (0x400) and kept
+//              in the published BAM. The metric algos below honour the flag, so
+//              coverage and duplication numbers still exclude duplicates.
+//              WgsMetricsAlgo gets an explicit --coverage_cap: the Picard-derived
+//              default of 250 truncates the depth histogram of a 200x library,
+//              which would depress mean_coverage and inflate pct_exc_capped.
+//              Emits the same channel shapes as SENTIEON_ALIGN_DEDUP +
+//              SENTIEON_DRIVER_METRICS combined, so downstream wiring is unchanged.
+// ============================================================================
+process SENTIEON_MERGE_DEDUP_METRICS {
+    tag "${sample_name}"
+
+    input:
+    tuple val(sample_name), path(bams), path(bais)
+    path fasta_ref
+    path base_metrics_intervals
+    path wgs_or_target_intervals
+    val mode
+    val coverage_cap
+
+    output:
+    tuple val(sample_name), path("${sample_name}.bam"), path("${sample_name}.bam.bai"), emit: bam
+    tuple val(sample_name), path("${sample_name}.dedup_sentieonmetrics.txt"), emit: dedup_metrics
+    tuple val(sample_name), path("*sentieonmetrics*"), emit: metrics_tuple
+    path("*sentieonmetrics*"), emit: metrics_flat
+
+    script:
+    def cap_opt = coverage_cap ? "--coverage_cap ${coverage_cap} " : ""
+    // Build the repeated -i list in Groovy rather than by shell word-splitting.
+    // `bams` is a bare Path when a biosample produced a single shard.
+    def bam_list   = (bams instanceof List) ? bams : [bams]
+    def input_args = bam_list.collect { "-i '${it.name}'" }.join(' ')
+    def metrics_block = mode == 'exome' ? """
+    sentieon driver -t ${task.cpus} -r ${fasta_ref}/genome.fa -i ${sample_name}.bam \\
+        --interval ${wgs_or_target_intervals} \\
+        --algo GCBias --summary ${sample_name}.gcbias_summary.sentieonmetrics.txt ${sample_name}.gcbias.sentieonmetrics.txt \\
+        --algo AlignmentStat ${sample_name}.alignmentstat_sentieonmetrics.txt \\
+        --algo InsertSizeMetricAlgo ${sample_name}.insertsizemetricalgo.sentieonmetrics.txt \\
+        --algo MeanQualityByCycle ${sample_name}.meanqualitybycycle.sentieonmetrics.txt \\
+        --algo QualityYield ${sample_name}.qualityyield_sentieonmetrics.txt \\
+        --algo CoverageMetrics ${sample_name}.cov_sentieonmetrics
+
+    # WGS metrics not applicable in exome mode
+    touch ${sample_name}.wgsmetricsalgo.sentieonmetrics.txt
+""" : """
+    sentieon driver -t ${task.cpus} -r ${fasta_ref}/genome.fa -i ${sample_name}.bam \\
+        --interval ${base_metrics_intervals} \\
+        --algo GCBias --summary ${sample_name}.gcbias_summary.sentieonmetrics.txt ${sample_name}.gcbias.sentieonmetrics.txt \\
+        --algo AlignmentStat ${sample_name}.alignmentstat_sentieonmetrics.txt \\
+        --algo InsertSizeMetricAlgo ${sample_name}.insertsizemetricalgo.sentieonmetrics.txt \\
+        --algo MeanQualityByCycle ${sample_name}.meanqualitybycycle.sentieonmetrics.txt \\
+        --algo QualityYield ${sample_name}.qualityyield_sentieonmetrics.txt \\
+        --algo CoverageMetrics ${sample_name}.cov_sentieonmetrics --omit_base_output --omit_locus_stat --omit_sample_stat
+
+    sentieon driver -t ${task.cpus} -r ${fasta_ref}/genome.fa -i ${sample_name}.bam \\
+        --interval ${wgs_or_target_intervals} \\
+        --algo WgsMetricsAlgo ${cap_opt}${sample_name}.wgsmetricsalgo.sentieonmetrics.txt
+
+    # HS metrics not applicable in WGS mode
+    touch ${sample_name}.hsmetricalgo.sentieonmetrics.txt
+"""
+    """
+    set +u
+    export SENTIEON_LICENSE=\$SENTIEON_LICENSE_SERVER
+
+    # One -i per shard (${bam_list.size()} shard(s) for this biosample). Equivalent
+    # to pre-merging the BAMs, without writing the merged copy to disk first.
+    echo "Merging + marking duplicates across shards: ${input_args}"
+
+    sentieon driver -t ${task.cpus} ${input_args} \\
+        --algo LocusCollector --fun score_info '${sample_name}.locuscollector_score.gz'
+
+    # No --rmdup: mark duplicates, keep them in the BAM.
+    sentieon driver -t ${task.cpus} -r ${fasta_ref}/genome.fa ${input_args} \\
+        --algo Dedup --score_info ${sample_name}.locuscollector_score.gz \\
+        --metrics ${sample_name}.dedup_sentieonmetrics.txt ${sample_name}.bam
+
+    samtools index -@ ${task.cpus} '${sample_name}.bam'
+
+    # Free the score file before the metric passes — it is large on a deep library.
+    rm -f '${sample_name}.locuscollector_score.gz'
+${metrics_block}
     """
 }
 
@@ -726,7 +975,21 @@ PYEOF
 //              qc_status is set to PENDING (cluster QC scoring added later).
 //              WGS coverage fields are null for exome; HS fields are null for WGS.
 //              all_metrics: collected dedup + sentieon + picard (exome only) files.
-//              total_reads comes from AlignmentStat (post-subsampling when enabled).
+//
+//              Read-count reporting (two distinct columns):
+//                total_reads       — original input read count (R1 records + R2
+//                                    records), from SEQKIT_SAMPLE (FASTQ) or
+//                                    SAMTOOLS_SUBSAMPLE_CRAM (CRAM) via
+//                                    <sample>_read_counts.txt. Matches
+//                                    basej-dnaqc/basej-rnaqc and the legacy
+//                                    nf-wgs-pipeline COUNT_READS_FASTQ definition.
+//                                    Falls back to align_total_reads when no raw
+//                                    count exists (bulk mode, skip_subsampling),
+//                                    so the R depth-floor gate always has a value.
+//                align_total_reads — AlignmentStat/Picard TOTAL_READS from the
+//                                    deduplicated BAM/CRAM (post-subsampling).
+//                                    Always populated. Equivalent to the legacy
+//                                    "Total Reads After Dedup" metric.
 // ============================================================================
 process WGS_QC_METRICS_TO_PARQUET {
     tag "wgsqc_metrics_to_parquet"
@@ -778,8 +1041,11 @@ if not sample_names:
 
 print(f"Found {len(sample_names)} samples: {sorted(sample_names)}")
 
-# ========== Load read counts from CRAM subsampling (Ultima platform only) ==========
-# readcount_files are staged by Nextflow into the work directory
+# ========== Load original input read counts ==========
+# Written by SEQKIT_SAMPLE (FASTQ) and SAMTOOLS_SUBSAMPLE_CRAM (CRAM);
+# staged by Nextflow into the work directory. Line 1 = TOTAL_READS
+# (pre-subsampling), line 2 = FINAL_READS (post-subsampling).
+# Absent in bulk mode and when skip_subsampling=true.
 readcount_map = {}
 for f in glob.glob("*_read_counts.txt"):
     try:
@@ -788,8 +1054,11 @@ for f in glob.glob("*_read_counts.txt"):
             if len(lines) >= 1:
                 sample = os.path.basename(f).replace("_read_counts.txt", "")
                 total = int(lines[0])  # First line is TOTAL_READS
-                readcount_map[sample] = {"total_reads": total}
-                print(f"Loaded read counts for {sample}: total={total}")
+                entry = {"total_reads": total}
+                if len(lines) >= 2:
+                    entry["final_reads"] = int(lines[1])
+                readcount_map[sample] = entry
+                print(f"Loaded read counts for {sample}: {entry}")
     except Exception as e:
         print(f"Warning: Could not parse {f}: {e}")
 print(f"DEBUG: Found {len(readcount_map)} samples with read count files")
@@ -815,8 +1084,8 @@ for sample in sorted(sample_names):
     # Picard CollectAlignmentSummaryMetrics / Sentieon AlignmentStat emits one
     # row per CATEGORY: FIRST_OF_PAIR, SECOND_OF_PAIR, PAIR (paired-end), or
     # UNPAIRED (single-end, e.g. Ultima CRAM). Prefer PAIR; fall back to
-    # UNPAIRED so single-end data still populates total_reads, mismatch rate,
-    # mean_read_length, etc. PCT_CHIMERAS is undefined for single-end and
+    # UNPAIRED so single-end data still populates align_total_reads, mismatch
+    # rate, mean_read_length, etc. PCT_CHIMERAS is undefined for single-end and
     # remains 0.0 in that case.
     for f in glob.glob(f"{sample}*.alignmentstat_sentieonmetrics.txt"):
         try:
@@ -835,7 +1104,7 @@ for sample in sorted(sample_names):
                                 rows_by_cat[cat] = dict(zip(headers, parts))
                 d = rows_by_cat.get("PAIR") or rows_by_cat.get("UNPAIRED")
                 if d:
-                    summary["total_reads"]               = int(d.get("TOTAL_READS", 0))
+                    summary["align_total_reads"]         = int(d.get("TOTAL_READS", 0))
                     summary["pf_reads_aligned"]          = int(d.get("PF_READS_ALIGNED", 0))
                     summary["pf_aligned_bases"]          = int(d.get("PF_ALIGNED_BASES", 0))
                     summary["pf_hq_aligned_reads"]       = int(d.get("PF_HQ_ALIGNED_READS", 0))
@@ -879,10 +1148,18 @@ for sample in sorted(sample_names):
         except Exception as e:
             print(f"Warning: Could not parse QualityYield for {sample}: {e}")
 
-    # ========== Override total_reads from CRAM subsampling if available ==========
+    # ========== Set total_reads from the original input read count ==========
+    # Preferred source for total_reads: the raw pre-subsampling count written by
+    # SEQKIT_SAMPLE (FASTQ) or SAMTOOLS_SUBSAMPLE_CRAM (CRAM). This is the
+    # legacy nf-wgs-pipeline definition and matches basej-dnaqc/basej-rnaqc.
+    # When absent (bulk mode, skip_subsampling=true) the fallback to
+    # align_total_reads is applied in the "Ensure all expected fields" block below.
     if sample in readcount_map:
         summary["total_reads"] = readcount_map[sample]["total_reads"]
-        print(f"Overrode total_reads for {sample} with CRAM subsampling count: {summary['total_reads']}")
+        summary["total_reads_source"] = "raw_input"
+        if "final_reads" in readcount_map[sample]:
+            summary["final_reads"] = readcount_map[sample]["final_reads"]
+        print(f"Set total_reads for {sample} from raw input count: {summary['total_reads']}")
 
     # ========== Parse Dedup Metrics ==========
     for f in glob.glob(f"{sample}*.dedup_sentieonmetrics.txt"):
@@ -1130,8 +1407,20 @@ for sample in sorted(sample_names):
     # ========== Ensure all expected fields are set ==========
     if "pct_chimeras" not in summary:
         summary["pct_chimeras"] = 0.0
+    if "align_total_reads" not in summary:
+        summary["align_total_reads"] = 0
+
+    # total_reads falls back to the aligned count when no raw input count was
+    # produced (bulk mode, skip_subsampling=true). Without this the R depth-floor
+    # gate would see 0 and WGS_QC_PLOTS would force FAIL on every sample.
+    # A raw count that is legitimately 0 is kept as-is (and still FAILs), so the
+    # presence check is on the key, not on truthiness.
     if "total_reads" not in summary:
-        summary["total_reads"] = 0
+        summary["total_reads"] = summary["align_total_reads"]
+        summary["total_reads_source"] = "alignment"
+
+    if "final_reads" not in summary:
+        summary["final_reads"] = None
 
     all_summaries.append(summary)
 
@@ -1145,15 +1434,15 @@ for sample in sorted(sample_names):
         f.write("# pconfig:\\n")
         f.write(f"#   id: '{mode_prefix}qc_summary_table'\\n")
         if mode == 'wgs':
-            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tPCT_Duplication\\tPCT_1x\\tPCT_5x\\tPCT_10x\\tPCT_30x\\tPCT_Chimeras\\tMean_Coverage\\tInsert_Median\\tAT_Dropout\\tGC_Dropout\\n")
-            f.write(f"{sample}\\tPENDING\\tNA\\t{summary.get('total_reads', 0)}\\t{summary.get('pct_duplication', 0):.4f}\\t")
+            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tAlign_Total_Reads\\tPCT_Duplication\\tPCT_1x\\tPCT_5x\\tPCT_10x\\tPCT_30x\\tPCT_Chimeras\\tMean_Coverage\\tInsert_Median\\tAT_Dropout\\tGC_Dropout\\n")
+            f.write(f"{sample}\\tPENDING\\tNA\\t{summary.get('total_reads', 0)}\\t{summary.get('align_total_reads', 0)}\\t{summary.get('pct_duplication', 0):.4f}\\t")
             f.write(f"{summary.get('pct_1x', 0) or 0:.4f}\\t{summary.get('pct_5x', 0) or 0:.4f}\\t")
             f.write(f"{summary.get('pct_10x', 0) or 0:.4f}\\t{summary.get('pct_30x', 0) or 0:.4f}\\t")
             f.write(f"{summary.get('pct_chimeras', 0):.4f}\\t{summary.get('mean_coverage', 0) or 0:.2f}\\t")
             f.write(f"{summary.get('insert_median', 0) or 0:.0f}\\t{summary.get('at_dropout', 0) or 0:.4f}\\t{summary.get('gc_dropout', 0) or 0:.4f}\\n")
         else:
-            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tPCT_Target_10x\\tZero_Cvg_Targets_Pct\\tFold_80_Base_Penalty\\tMean_Target_Coverage\\tPCT_Selected_Bases\\tInsert_Median\\tPCT_Chimeras\\n")
-            f.write(f"{sample}\\tPENDING\\tNA\\t{summary.get('total_reads', 0)}\\t")
+            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tAlign_Total_Reads\\tPCT_Target_10x\\tZero_Cvg_Targets_Pct\\tFold_80_Base_Penalty\\tMean_Target_Coverage\\tPCT_Selected_Bases\\tInsert_Median\\tPCT_Chimeras\\n")
+            f.write(f"{sample}\\tPENDING\\tNA\\t{summary.get('total_reads', 0)}\\t{summary.get('align_total_reads', 0)}\\t")
             f.write(f"{summary.get('pct_target_bases_10x', 0) or 0:.4f}\\t{summary.get('zero_cvg_targets_pct', 0) or 0:.4f}\\t")
             f.write(f"{summary.get('fold_80_base_penalty', 0) or 0:.4f}\\t{summary.get('mean_target_coverage', 0) or 0:.2f}\\t")
             f.write(f"{summary.get('pct_selected_bases', 0) or 0:.4f}\\t{summary.get('insert_median', 0) or 0:.0f}\\t")
@@ -1163,7 +1452,8 @@ for sample in sorted(sample_names):
 
 # ========== Write Parquets ==========
 _str_cols    = ['biosample','dataset_id','pipeline','pipeline_version','molecule_type',
-                'mode','genome','workspace','workflow_id','user','qc_status']
+                'mode','genome','workspace','workflow_id','user','qc_status',
+                'total_reads_source']
 _double_cols = ['pct_duplication','pf_mismatch_rate','pf_hq_error_rate','pf_indel_rate',
                 'pct_reads_aligned_in_pairs','pct_chimeras','pct_adapter','strand_balance',
                 'mean_read_length',
@@ -1182,7 +1472,7 @@ _double_cols = ['pct_duplication','pf_mismatch_rate','pf_hq_error_rate','pf_inde
                 'pct_target_bases_1x','pct_target_bases_2x','pct_target_bases_10x','pct_target_bases_20x',
                 'pct_target_bases_30x','pct_target_bases_40x','pct_target_bases_50x','pct_target_bases_100x',
                 'pct_target_bases_250x','pct_target_bases_500x','pct_target_bases_1000x']
-_bigint_cols = ['total_reads','pf_reads_aligned',
+_bigint_cols = ['total_reads','final_reads','align_total_reads','pf_reads_aligned',
                 'pf_aligned_bases','pf_hq_aligned_reads','pf_hq_aligned_bases','pf_hq_aligned_q20_bases',
                 'estimated_library_size','read_pairs_examined',
                 'read_pair_duplicates','read_pair_optical_duplicates','insert_read_pairs',
@@ -1243,6 +1533,7 @@ process WGS_QC_PLOTS {
     path("*_${mode_prefix}qc_mqc.txt"),                                                    emit: mqc_metrics
     path("*-QC_ConsensusScores.txt"),                                                       emit: scores
     path("*-QC_ConsensusScores_SummaryTable_mqc.txt"),                                      emit: scores_summary
+    path("*-QC_QCBand_SummaryTable_mqc.txt"),                              optional: true,  emit: scores_bands
     path("per_biosample_status.csv"),                                                       emit: per_biosample_status
 
     script:
@@ -1280,18 +1571,18 @@ else:
         columns={"SampleId": "biosample", "CompositeScore": "qc_score"})
     scores_df["qc_score"] = pd.to_numeric(scores_df["qc_score"], errors="coerce")
 
+    # Both modes now use the shared 1-5 tier scale (see containers/qc_plots/scripts/qc_scoring.R),
+    # where tier 4 means "all of the assay's gates pass" regardless of how many gates there are.
+    # Previously exome shifted the bands down one (>=3 PASS) to compensate for WES having four
+    # gates instead of five, which is no longer needed and would report a Borderline exome as
+    # PASS. Bands: 5,4 = PASS | 3 = Borderline | 2,1 = FAIL.
     def score_to_status(s):
         if pd.isna(s):
             return "PENDING"
         s = int(s)
-        if mode == "wgs":
-            if s >= 4: return "PASS"
-            if s == 3: return "Borderline"
-            return "FAIL"
-        else:  # exome
-            if s >= 3: return "PASS"
-            if s == 2: return "Borderline"
-            return "FAIL"
+        if s >= 4: return "PASS"
+        if s == 3: return "Borderline"
+        return "FAIL"
 
     scores_df["qc_status"] = scores_df["qc_score"].apply(score_to_status)
 
@@ -1305,8 +1596,11 @@ all_df = pd.read_csv("input_metrics.tsv", sep="\\t")
 all_df["qc_status"] = all_df["biosample"].map(status_map).fillna("PENDING")
 all_df["qc_score"]  = all_df["biosample"].map(score_map)
 
-# Override score for zero-read samples — R scoring assigns non-zero scores
-# to samples with all-zero metrics, but they should show as FAIL / NA
+# Override score for zero-read samples. Under the old count-of-gates scoring these picked up
+# credit for the lower-is-better gates (duplication 0 < 0.25, chimeras 0 < 0.15) and scored
+# non-zero. The tier scoring no longer does that - a zero-read sample sits below the depth
+# floor and lands in tier 2 (Inconclusive) - but this pipeline reports such samples as an
+# outright FAIL with no score, so the override stays.
 for idx, row in all_df.iterrows():
     if int(row.get("total_reads", 0) or 0) == 0:
         all_df.at[idx, "qc_status"] = "FAIL"
@@ -1318,7 +1612,8 @@ print(f"Found {len(all_df)} samples to update")
 
 # ========== Schema definitions (mirrors WGS_QC_METRICS_TO_PARQUET + qc_score) ==========
 _str_cols    = ['biosample', 'dataset_id', 'pipeline', 'pipeline_version', 'molecule_type',
-                'mode', 'genome', 'workspace', 'workflow_id', 'user', 'qc_status']
+                'mode', 'genome', 'workspace', 'workflow_id', 'user', 'qc_status',
+                'total_reads_source']
 _double_cols = ['pct_duplication', 'pf_mismatch_rate', 'pf_hq_error_rate', 'pf_indel_rate',
                 'pct_reads_aligned_in_pairs', 'pct_chimeras', 'pct_adapter', 'strand_balance',
                 'mean_read_length',
@@ -1337,7 +1632,7 @@ _double_cols = ['pct_duplication', 'pf_mismatch_rate', 'pf_hq_error_rate', 'pf_i
                 'pct_target_bases_1x', 'pct_target_bases_2x', 'pct_target_bases_10x', 'pct_target_bases_20x',
                 'pct_target_bases_30x', 'pct_target_bases_40x', 'pct_target_bases_50x', 'pct_target_bases_100x',
                 'pct_target_bases_250x', 'pct_target_bases_500x', 'pct_target_bases_1000x']
-_bigint_cols = ['total_reads', 'pf_reads_aligned',
+_bigint_cols = ['total_reads', 'final_reads', 'align_total_reads', 'pf_reads_aligned',
                 'pf_aligned_bases', 'pf_hq_aligned_reads', 'pf_hq_aligned_bases', 'pf_hq_aligned_q20_bases',
                 'estimated_library_size', 'read_pairs_examined',
                 'read_pair_duplicates', 'read_pair_optical_duplicates', 'insert_read_pairs',
@@ -1388,15 +1683,15 @@ for _, row in all_df.iterrows():
         f.write("# pconfig:\\n")
         f.write(f"#   id: '{mode_prefix}qc_summary_table'\\n")
         if mode == "wgs":
-            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tPCT_Duplication\\tPCT_1x\\tPCT_5x\\tPCT_10x\\tPCT_30x\\tPCT_Chimeras\\tMean_Coverage\\tInsert_Median\\tAT_Dropout\\tGC_Dropout\\n")
-            f.write(f"{sample}\\t{status}\\t{score_str}\\t{int(row.get('total_reads', 0) or 0)}\\t{float(row.get('pct_duplication', 0) or 0):.4f}\\t")
+            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tAlign_Total_Reads\\tPCT_Duplication\\tPCT_1x\\tPCT_5x\\tPCT_10x\\tPCT_30x\\tPCT_Chimeras\\tMean_Coverage\\tInsert_Median\\tAT_Dropout\\tGC_Dropout\\n")
+            f.write(f"{sample}\\t{status}\\t{score_str}\\t{int(row.get('total_reads', 0) or 0)}\\t{int(row.get('align_total_reads', 0) or 0)}\\t{float(row.get('pct_duplication', 0) or 0):.4f}\\t")
             f.write(f"{float(row.get('pct_1x', 0) or 0):.4f}\\t{float(row.get('pct_5x', 0) or 0):.4f}\\t")
             f.write(f"{float(row.get('pct_10x', 0) or 0):.4f}\\t{float(row.get('pct_30x', 0) or 0):.4f}\\t")
             f.write(f"{float(row.get('pct_chimeras', 0) or 0):.4f}\\t{float(row.get('mean_coverage', 0) or 0):.2f}\\t")
             f.write(f"{float(row.get('insert_median', 0) or 0):.0f}\\t{float(row.get('at_dropout', 0) or 0):.4f}\\t{float(row.get('gc_dropout', 0) or 0):.4f}\\n")
         else:
-            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tPCT_Target_10x\\tZero_Cvg_Targets_Pct\\tFold_80_Base_Penalty\\tMean_Target_Coverage\\tPCT_Selected_Bases\\tInsert_Median\\tPCT_Chimeras\\n")
-            f.write(f"{sample}\\t{status}\\t{score_str}\\t{int(row.get('total_reads', 0) or 0)}\\t")
+            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tAlign_Total_Reads\\tPCT_Target_10x\\tZero_Cvg_Targets_Pct\\tFold_80_Base_Penalty\\tMean_Target_Coverage\\tPCT_Selected_Bases\\tInsert_Median\\tPCT_Chimeras\\n")
+            f.write(f"{sample}\\t{status}\\t{score_str}\\t{int(row.get('total_reads', 0) or 0)}\\t{int(row.get('align_total_reads', 0) or 0)}\\t")
             f.write(f"{float(row.get('pct_target_bases_10x', 0) or 0):.4f}\\t{float(row.get('zero_cvg_targets_pct', 0) or 0):.4f}\\t")
             f.write(f"{float(row.get('fold_80_base_penalty', 0) or 0):.4f}\\t{float(row.get('mean_target_coverage', 0) or 0):.2f}\\t")
             f.write(f"{float(row.get('pct_selected_bases', 0) or 0):.4f}\\t{float(row.get('insert_median', 0) or 0):.0f}\\t")
@@ -1509,9 +1804,14 @@ custom_data:
         placement: 110
       Total_Reads:
         title: "Total Reads"
-        description: "Total number of read pairs"
+        description: "Original number of input reads, counted across both mates (R1 records + R2 records) before subsampling, trimming or alignment. Source: SEQKIT_SAMPLE (FASTQ) or SAMTOOLS_SUBSAMPLE_CRAM (CRAM). Falls back to Align_Total_Reads in bulk mode or when skip_subsampling is set."
         format: "{:,.0f}"
         placement: 120
+      Align_Total_Reads:
+        title: "Total Reads After Dedup"
+        description: "Total reads in the deduplicated alignment, including all PF and non-PF reads, counted across both mates. Reflects post-subsampling data. Source: Sentieon AlignmentStat / Picard CollectAlignmentSummaryMetrics TOTAL_READS."
+        format: "{:,.0f}"
+        placement: 125
       PCT_Duplication:
         title: "Proportion Duplication"
         description: "Proportion of duplicate read pairs (0-1). Source: Sentieon Dedup PERCENT_DUPLICATION. Note: coordinate-based detection may undercount duplicates in amplification-based chemistries."
@@ -1606,6 +1906,71 @@ workflow {
     // Set defaults for optional params
     if (!params.architecture) params.architecture = "x86"
 
+    // ------------------------------------------------------------------------
+    // Analysis mode: 'single_cell' (default) or 'bulk'.
+    //   single_cell — unchanged behaviour: one alignment task per biosample,
+    //                 capped at max_total_reads (1B) by SEQKIT_SAMPLE.
+    //   bulk        — for deep bulk libraries (e.g. 200x WGS). Nothing is
+    //                 subsampled; each FASTQ unit is SPLIT into parts of
+    //                 bulk_split_reads reads, the parts are aligned in
+    //                 parallel, then merged + duplicate-marked + measured in a
+    //                 single task (SENTIEON_MERGE_DEDUP_METRICS).
+    // ------------------------------------------------------------------------
+    def analysis_mode = (params.analysis_mode ?: 'single_cell').toString().trim()
+    if (!(analysis_mode in ['single_cell', 'bulk'])) {
+        exit 1, "ERROR: params.analysis_mode must be 'single_cell' or 'bulk'; got '${params.analysis_mode}'"
+    }
+    def bulk_mode = (analysis_mode == 'bulk')
+
+    // bulk_split_reads counts reads across BOTH mates (same convention as
+    // max_total_reads); seqkit splits per file, so it needs read PAIRS.
+    def bulk_pairs_per_part = 0L
+    if (bulk_mode) {
+        if (params.pipeline_tool != 'sentieon') {
+            exit 1, "ERROR: analysis_mode='bulk' is currently implemented for the Sentieon path only; " +
+                    "got pipeline_tool='${params.pipeline_tool}'. Re-run with --pipeline_tool sentieon."
+        }
+        if (params.coverage_target != null && params.coverage_target.toString().trim() != "" &&
+                params.coverage_target.toString().trim() != "0") {
+            exit 1, "ERROR: analysis_mode='bulk' and coverage_target are mutually exclusive. " +
+                    "coverage_target subsamples CRAM input to a fixed depth, while bulk mode keeps every " +
+                    "read of a FASTQ library. Unset one of them."
+        }
+        def split_reads
+        try {
+            split_reads = (params.bulk_split_reads as Number).longValue()
+        } catch (Exception e) {
+            exit 1, "ERROR: params.bulk_split_reads must be a positive integer; got '${params.bulk_split_reads}'"
+        }
+        if (split_reads < 2) {
+            exit 1, "ERROR: params.bulk_split_reads must be >= 2 (it counts reads across both mates); got ${split_reads}"
+        }
+        bulk_pairs_per_part = split_reads.intdiv(2)
+
+        // bulk_coverage_cap is interpolated straight into the Sentieon command
+        // line; validate here so a bad value is a parameter error rather than a
+        // Sentieon usage error hours into the run. (The schema's `minimum` is UI
+        // metadata only — no schema-validation plugin is configured.)
+        def cap
+        try {
+            cap = (params.bulk_coverage_cap as Number).intValue()
+        } catch (Exception e) {
+            exit 1, "ERROR: params.bulk_coverage_cap must be a positive integer; got '${params.bulk_coverage_cap}'"
+        }
+        if (cap < 1) {
+            exit 1, "ERROR: params.bulk_coverage_cap must be a positive integer; got ${cap}"
+        }
+
+        if (params.mode == 'exome') {
+            log.warn "analysis_mode='bulk' with mode='exome' is untested. Splitting is unnecessary for exome " +
+                     "depth, bulk_coverage_cap does not apply (WgsMetricsAlgo is skipped in exome mode), and " +
+                     "PICARD_COLLECTHSMETRICS is not sized for a deep merged BAM."
+        }
+
+        log.info "Bulk mode enabled: no subsampling. FASTQs are split into parts of ${split_reads} reads " +
+                 "(${bulk_pairs_per_part} pairs), aligned in parallel, then merged and duplicate-MARKED in one task."
+    }
+
     // Coverage-targeted subsampling (Ultima/CRAM only). When set, every CRAM
     // biosample is subsampled to this single target coverage and renamed
     // `{biosample}_cov{NN}x`. Requires a `custom_mean_coverage` column in
@@ -1688,6 +2053,14 @@ workflow {
     } else {
         ch_cram_reads = ch_split.cram
             .map { row ->
+                // Bulk mode splits FASTQ reads before alignment; a CRAM is already
+                // aligned, so there is nothing to shard. Fail loudly rather than
+                // silently routing it down the single-cell metrics-only path.
+                if (bulk_mode) {
+                    exit 1, "ERROR: analysis_mode='bulk' does not support CRAM input " +
+                            "(biosample '${row.biosampleName}'). Bulk mode is FASTQ-only; " +
+                            "run CRAM/Ultima inputs with analysis_mode='single_cell'."
+                }
                 def cram_file = file(row.cram)
                 def crai_file = file(row.cram + '.crai')
                 [row.biosampleName, cram_file, crai_file, "CRAM"]
@@ -1698,35 +2071,68 @@ workflow {
     // FASTQ path: multi-lane support via pipe-delimited ("|") read1/read2 paths
     //   Single-lane: biosampleName,s3://bucket/R1.fastq.gz,s3://bucket/R2.fastq.gz
     //   Multi-lane:  biosampleName,s3://bucket/L001_R1.fq.gz|s3://bucket/L002_R1.fq.gz,s3://bucket/L001_R2.fq.gz|s3://bucket/L002_R2.fq.gz
-    ch_fastq_branched = ch_split.fastq
-        .branch {
-            multilane: it.read1.contains('|')
-            singlelane: true
-        }
-
-    // Single-lane: one R1, one R2 — pass through directly with read_type
-    ch_fastq_singlelane = ch_fastq_branched.singlelane
-        .map { row -> [row.biosampleName, [file(row.read1), file(row.read2)], "FASTQ"] }
-
-    // Multi-lane: split on "|", collect file objects, flatten for cat
-    MERGE_MULTILANE_FASTQ(
-        ch_fastq_branched.multilane
-            .map { row ->
-                def r1_files = row.read1.tokenize('|').collect { file(it.trim()) }
-                def r2_files = row.read2.tokenize('|').collect { file(it.trim()) }
-                [row.biosampleName, r1_files + r2_files]
+    //
+    // Bulk mode takes a different route entirely: lanes are NOT cat'ed together.
+    // A lane is already an independent unit of reads, and every unit is split and
+    // aligned separately before being merged at the dedup step — so cat'ing first
+    // would mean reading and rewriting the whole (multi-TB) library for nothing.
+    if (bulk_mode) {
+        // One alignment unit per (biosample, lane). Units regroup by biosample at
+        // SENTIEON_MERGE_DEDUP_METRICS, so cross-lane duplicates are still marked.
+        ch_bulk_units = ch_split.fastq
+            .flatMap { row ->
+                def r1s = row.read1.tokenize('|').collect { file(it.trim()) }
+                def r2s = row.read2.tokenize('|').collect { file(it.trim()) }
+                if (r1s.size() != r2s.size()) {
+                    exit 1, "ERROR: biosample '${row.biosampleName}' has ${r1s.size()} read1 file(s) " +
+                            "but ${r2s.size()} read2 file(s). Multi-lane read1/read2 lists must be the same length."
+                }
+                (0..<r1s.size()).collect { i ->
+                    [row.biosampleName, "${row.biosampleName}_L${String.format('%02d', i + 1)}", [r1s[i], r2s[i]]]
+                }
             }
-    )
 
-    ch_fastq_reads = ch_fastq_singlelane
-        .mix(MERGE_MULTILANE_FASTQ.out.reads.map { sample_id, reads -> [sample_id, reads, "FASTQ"] })
+        ch_bulk_units.view { unit -> "Processing bulk unit: ${unit[1]} (biosample: ${unit[0]})" }
+        ch_bulk_units.ifEmpty { exit 1, "ERROR: No valid FASTQ samples found in --input_csv (analysis_mode='bulk' requires FASTQ input)" }
+
+        ch_fastq_reads = channel.empty()
+    } else {
+        ch_bulk_units = channel.empty()
+
+        ch_fastq_branched = ch_split.fastq
+            .branch {
+                multilane: it.read1.contains('|')
+                singlelane: true
+            }
+
+        // Single-lane: one R1, one R2 — pass through directly with read_type
+        ch_fastq_singlelane = ch_fastq_branched.singlelane
+            .map { row -> [row.biosampleName, [file(row.read1), file(row.read2)], "FASTQ"] }
+
+        // Multi-lane: split on "|", collect file objects, flatten for cat
+        MERGE_MULTILANE_FASTQ(
+            ch_fastq_branched.multilane
+                .map { row ->
+                    def r1_files = row.read1.tokenize('|').collect { file(it.trim()) }
+                    def r2_files = row.read2.tokenize('|').collect { file(it.trim()) }
+                    [row.biosampleName, r1_files + r2_files]
+                }
+        )
+
+        ch_fastq_reads = ch_fastq_singlelane
+            .mix(MERGE_MULTILANE_FASTQ.out.reads.map { sample_id, reads -> [sample_id, reads, "FASTQ"] })
+    }
 
     // Merged channel: [sample_name, reads, read_type]
     // Note: For CRAM, reads = [cram_file]; for FASTQ, reads = [r1, r2]
+    // In bulk mode this carries nothing — FASTQ units travel via ch_bulk_units
+    // and CRAM input is rejected above.
     ch_reads_merged = ch_cram_reads.mix(ch_fastq_reads)
 
-    ch_reads_merged.view { sample -> "Processing sample: ${sample[0]}, read_type: ${sample[sample.size()-1]}" }
-    ch_reads_merged.ifEmpty { exit 1, "ERROR: No valid CRAM or FASTQ samples found in --input_csv" }
+    if (!bulk_mode) {
+        ch_reads_merged.view { sample -> "Processing sample: ${sample[0]}, read_type: ${sample[sample.size()-1]}" }
+        ch_reads_merged.ifEmpty { exit 1, "ERROR: No valid CRAM or FASTQ samples found in --input_csv" }
+    }
 
     // Mode prefix for output naming: wgs → wgsqc_*, exome → wesqc_*
     def mode_prefix = params.mode == 'exome' ? 'wes' : 'wgs'
@@ -1745,7 +2151,15 @@ workflow {
     //              OR
     //            SAMTOOLS_SUBSAMPLE_CRAM_PROPORTION (when coverage_target is
     //            set — proportion derived from custom_mean_coverage in CSV)
-    if (use_coverage_subsample) {
+    if (bulk_mode) {
+        // Bulk mode never subsamples — SPLIT_FASTQ keeps every read and the parts
+        // are aligned below, so this whole stage is a no-op. The placeholder keeps
+        // the parquet step's path() input non-empty.
+        // No raw read count is produced here, so total_reads falls back to
+        // align_total_reads (AlignmentStat) in WGS_QC_METRICS_TO_PARQUET.
+        ch_aligned_reads     = channel.empty()
+        ch_readcount_metrics = channel.of(file('/dev/null')).collect()
+    } else if (use_coverage_subsample) {
         // Coverage-targeted subsampling: ignore skip_subsampling/max_total_reads
         // for the CRAM branch (FASTQ branch is untouched). Route every CRAM
         // record through the proportion-based subsampler.
@@ -1765,7 +2179,12 @@ workflow {
             params.samtools_seed
         )
 
-        // FASTQ branch follows the existing skip_subsampling logic
+        // FASTQ branch follows the existing skip_subsampling logic.
+        // SAMTOOLS_SUBSAMPLE_CRAM_PROPORTION doesn't write read_count files, so the
+        // raw input count is only available for the FASTQ side (SEQKIT_SAMPLE).
+        // CRAM samples on this path fall back to align_total_reads in
+        // WGS_QC_METRICS_TO_PARQUET. /dev/null keeps the parquet step's path()
+        // input non-empty (the Python glob for *_read_counts.txt won't match it).
         if (!params.skip_subsampling) {
             SEQKIT_SAMPLE(
                 ch_split_for_subsample.fastq.map { sample, reads, read_type -> [sample, reads, params.max_total_reads] },
@@ -1774,15 +2193,15 @@ workflow {
             ch_aligned_reads = SAMTOOLS_SUBSAMPLE_CRAM_PROPORTION.out.reads
                 .map { sample, cram, crai -> [sample, cram, "CRAM"] }
                 .mix(SEQKIT_SAMPLE.out.reads.map { sample, reads -> [sample, reads, "FASTQ"] })
+            ch_readcount_metrics = SEQKIT_SAMPLE.out.read_counts_file
+                .collect()
+                .ifEmpty([file('/dev/null')])
         } else {
             ch_aligned_reads = SAMTOOLS_SUBSAMPLE_CRAM_PROPORTION.out.reads
                 .map { sample, cram, crai -> [sample, cram, "CRAM"] }
                 .mix(ch_split_for_subsample.fastq.map { items -> [items[0], items[1], items[2]] })
+            ch_readcount_metrics = channel.of(file('/dev/null')).collect()
         }
-
-        // Coverage subsampling doesn't write read_count files; placeholder
-        // so the parquet step's path() input is non-empty.
-        ch_readcount_metrics = channel.of(file('/dev/null')).collect()
     } else if (!params.skip_subsampling) {
         ch_split_for_subsample = ch_reads_merged.branch {
             cram: it[it.size()-1] == "CRAM"  // read_type is last element
@@ -1808,9 +2227,12 @@ workflow {
             .map { sample, cram, crai -> [sample, cram, "CRAM"] }
             .mix(SEQKIT_SAMPLE.out.reads.map { sample, reads -> [sample, reads, "FASTQ"] })
         
-        // Collect read count files for Ultima/CRAM only
-        // Use /dev/null as fallback if no CRAM files (e.g., Illumina FASTQ-only run)
+        // Collect original input read counts from both branches: SEQKIT_SAMPLE
+        // (FASTQ) and SAMTOOLS_SUBSAMPLE_CRAM (CRAM). Either branch may be empty
+        // for a single-platform run, so mix first then fall back to /dev/null to
+        // keep the parquet step's path() input non-empty.
         ch_readcount_metrics = SAMTOOLS_SUBSAMPLE_CRAM.out.read_counts_file
+            .mix(SEQKIT_SAMPLE.out.read_counts_file)
             .collect()
             .ifEmpty([file('/dev/null')])
     } else {
@@ -1826,7 +2248,9 @@ workflow {
             }
         }
         // Use /dev/null as a placeholder to avoid empty channel error in Nextflow path() input
-        // Python glob for *_read_counts.txt won't match it, so it's effectively ignored
+        // Python glob for *_read_counts.txt won't match it, so it's effectively ignored.
+        // Nothing counts the raw FASTQs on this path, so total_reads falls back to
+        // align_total_reads (AlignmentStat) in WGS_QC_METRICS_TO_PARQUET.
         ch_readcount_metrics = channel.of(file('/dev/null')).collect()
     }
 
@@ -1839,7 +2263,9 @@ workflow {
     }
 
     // CRAM path needs the .crai too — re-attach from upstream channels
-    if (use_coverage_subsample) {
+    if (bulk_mode) {
+        ch_cram_for_metrics = channel.empty()   // bulk mode is FASTQ-only
+    } else if (use_coverage_subsample) {
         ch_cram_for_metrics = SAMTOOLS_SUBSAMPLE_CRAM_PROPORTION.out.reads  // [sample, cram, crai]
     } else if (!params.skip_subsampling) {
         ch_cram_for_metrics = SAMTOOLS_SUBSAMPLE_CRAM.out.reads  // [sample, cram, crai]
@@ -1850,6 +2276,9 @@ workflow {
     }
 
     // Step 2/3: Alignment, dedup and QC metrics.
+    //   analysis_mode='bulk' takes its own route (SPLIT_FASTQ → SENTIEON_ALIGN_SHARD
+    //   → SENTIEON_MERGE_DEDUP_METRICS) and is Sentieon-only; everything below the
+    //   channel handles is shared with single-cell.
     //   Toggle via params.pipeline_tool: 'sentieon' (proprietary — SENTIEON_ALIGN_DEDUP,
     //   SENTIEON_METRICS_CRAM and SENTIEON_DRIVER_METRICS) or the open-source path
     //   (BWAMEM2_ALIGN_DEDUP_METRICS + PICARD_METRICS_CRAM). Open-source is x86-only.
@@ -1858,7 +2287,64 @@ workflow {
     //     ch_dedup_metrics     — dedup metrics tuple       [sample, dedup_txt]
     //     ch_dedup_metrics_flat / ch_driver_metrics_flat / ch_cram_metrics_flat
     //     ch_driver_metrics_tuple / ch_cram_metrics_tuple  — for publish:
-    if (params.pipeline_tool == 'sentieon') {
+    if (bulk_mode) {
+        // ---- Bulk path (Sentieon): split → align shards in parallel → merge +
+        // mark duplicates + metrics in one task. -----------------------------
+        SPLIT_FASTQ(
+            ch_bulk_units,
+            bulk_pairs_per_part
+        )
+
+        // Pair R1/R2 parts into per-shard alignment jobs. Both globs are sorted
+        // by name and part numbers are zero-padded, so index i of each list is
+        // the same part — and index+1 is that part's number.
+        ch_bulk_shards = SPLIT_FASTQ.out.parts
+            .flatMap { sample_name, unit_id, r1_parts, r2_parts ->
+                def r1s = (r1_parts instanceof List ? r1_parts : [r1_parts]).sort(false) { it.name }
+                def r2s = (r2_parts instanceof List ? r2_parts : [r2_parts]).sort(false) { it.name }
+                if (r1s.size() != r2s.size()) {
+                    exit 1, "ERROR: SPLIT_FASTQ produced ${r1s.size()} R1 part(s) but ${r2s.size()} R2 part(s) for unit '${unit_id}'"
+                }
+                (0..<r1s.size()).collect { i ->
+                    [sample_name, "${unit_id}_part${String.format('%03d', i + 1)}", [r1s[i], r2s[i]]]
+                }
+            }
+
+        SENTIEON_ALIGN_SHARD(
+            ch_bulk_shards,
+            params.reference,
+            params.platform
+        )
+
+        // Regroup every shard of a biosample. Sorting by name makes the input
+        // order deterministic, which keeps the merge task's hash stable across
+        // -resume (groupTuple emission order otherwise varies run to run).
+        ch_bulk_shard_bams = SENTIEON_ALIGN_SHARD.out.bam
+            .groupTuple(by: 0)
+            .map { sample_name, bams, bais ->
+                [sample_name, bams.sort(false) { it.name }, bais.sort(false) { it.name }]
+            }
+
+        SENTIEON_MERGE_DEDUP_METRICS(
+            ch_bulk_shard_bams,
+            params.reference,
+            params.base_metrics_intervals,
+            wgs_or_target_intervals,
+            params.mode,
+            params.bulk_coverage_cap
+        )
+
+        ch_bam                  = SENTIEON_MERGE_DEDUP_METRICS.out.bam
+        ch_dedup_metrics        = SENTIEON_MERGE_DEDUP_METRICS.out.dedup_metrics
+        // The dedup metrics file is already caught by metrics_flat's
+        // *sentieonmetrics* glob (one process emits both), so keep this empty to
+        // avoid staging the same filename twice in WGS_QC_METRICS_TO_PARQUET.
+        ch_dedup_metrics_flat   = channel.empty()
+        ch_driver_metrics_flat  = SENTIEON_MERGE_DEDUP_METRICS.out.metrics_flat
+        ch_cram_metrics_flat    = channel.empty()
+        ch_driver_metrics_tuple = SENTIEON_MERGE_DEDUP_METRICS.out.metrics_tuple
+        ch_cram_metrics_tuple   = channel.empty()
+    } else if (params.pipeline_tool == 'sentieon') {
         SENTIEON_METRICS_CRAM(
             ch_cram_for_metrics,
             params.reference,

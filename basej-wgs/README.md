@@ -225,7 +225,65 @@ HG001-UltimaWGS_Z0022,s3://.../HG001-UltimaWGS_Z0022.cram
 
         --max_total_reads   VAL     Subsample target (total reads across mates) when enabled.
 
+        --analysis_mode     STR     Sample type: 'single_cell' or 'bulk'. Bulk mode is for deep
+                                    bulk libraries (e.g. 200x WGS) and requires
+                                    --pipeline_tool sentieon. See "Bulk mode" below.
+                                    DEFAULT: single_cell
+
+        --bulk_split_reads  VAL     Reads per split part in bulk mode, counted across both mates.
+                                    DEFAULT: 1000000000
+
+        --bulk_coverage_cap VAL     Depth histogram cap passed to Sentieon WgsMetricsAlgo in
+                                    bulk mode (wgs mode only).
+                                    DEFAULT: 1000
+
         --help              BOOL    Display help message
+```
+
+## Bulk mode (deep libraries)
+
+`--analysis_mode bulk` handles libraries that are too deep to align in a single
+task, such as 200x WGS (~4.1 billion reads at 2x150). It is **Sentieon-only** for
+now (`--pipeline_tool sentieon`); the open-source equivalent is not implemented yet.
+
+What changes compared with the default `single_cell` mode:
+
+- **Nothing is subsampled.** Instead of capping at `max_total_reads`, each FASTQ
+  unit is split into parts of `--bulk_split_reads` reads (**SeqKit** `split2`,
+  mates kept in lockstep), so a 200x library becomes 4-5 parts.
+- **Parts are aligned in parallel** (`SENTIEON_ALIGN_SHARD`), one task each. All
+  parts of a biosample share an identical `@RG` (same `ID`, `SM` and `LB`) so the
+  merged library is treated as one read group and one library.
+- **Merge, duplicate marking and metrics run in a single task**
+  (`SENTIEON_MERGE_DEDUP_METRICS`). `sentieon driver` takes one `-i` per part and
+  merges them in place, so a several-hundred-GB BAM is never staged in and out
+  between steps. LocusCollector + Dedup see every part at once, which is what
+  makes cross-part duplicates detectable.
+- **Duplicates are marked, not removed.** Dedup runs without `--rmdup`, so the
+  published BAM keeps duplicate reads flagged `0x400`. Coverage and duplication
+  metrics still exclude them.
+- **Multi-lane input is not merged.** Each lane is aligned as its own unit and the
+  lanes regroup at the duplicate-marking step, so there is no full-library `cat`
+  pass. Cross-lane duplicates are still marked.
+- **`WgsMetricsAlgo` gets a raised `--coverage_cap`** (`--bulk_coverage_cap`,
+  default 1000). The Picard-derived default of 250 truncates the depth histogram
+  of a 200x library, which would depress `mean_coverage` and inflate
+  `pct_exc_capped`. Single-cell metrics are unchanged.
+
+Everything downstream (Parquet metrics, QC scores/plots, MultiQC, published BAM)
+is identical to a single-cell run, and the output is alignment + QC only — no CNV
+and no variant calling.
+
+Constraints: FASTQ input only (CRAM/Ultima rows are rejected), mutually exclusive
+with `--coverage_target`.
+
+```bash
+nextflow run main.nf \
+  --input_csv bulk_samples.csv \
+  --analysis_mode bulk \
+  --pipeline_tool sentieon \
+  --genome GRCh38 --mode wgs \
+  --outputDir results_bulk
 ```
 
 ## Tool versions (open-source run)

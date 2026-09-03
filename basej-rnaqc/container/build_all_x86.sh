@@ -13,7 +13,7 @@ BUILDS=(
   "ubuntu:basejumper_ubuntu_24.04_stable"
   "seqkit:basejumper_seqkit-2.13.0"
   "custom_r_nf_rnaseq:basejumper_custom_r_nf_rnaseq_0.10"
-  "custom_r_qcplots:basejumper_custom_r_qcplots_0.2.3"
+  "custom_r_qcplots:basejumper_custom_r_qcplots_0.3.0"
   "gene_body_coverage:basejumper_gene_body_coverage_0.2.1"
 )
 

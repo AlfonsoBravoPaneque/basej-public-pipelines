@@ -58,6 +58,15 @@ process DEEPVARIANT_MAKE_EXAMPLES_ONLY {
     script:
     def regions_arg = params.mode == "exome" ? "--regions ${regions}" : ""
     def gvcf_arg    = params.make_gvcf ? "--gvcf \"${sample_name}.gvcf.tfrecord@${task.cpus}.gz\"" : ""
+    // The bioskrybv2 (ResolveOME "rome") model was trained with an explicit
+    // channel set that adds the `identity` channel on top of the default
+    // BASE_CHANNELS + allele_frequency + insert_size used by bioskrybv1. The
+    // model's example_info.json declares a [100,221,10] / 9-channel input, so
+    // make_examples MUST build the same channels or call_variants fails on a
+    // tensor-shape mismatch. bioskrybv1 keeps the pipeline default (no flag),
+    // so this is additive and does not change the existing model's behaviour.
+    def channel_arg = params.deepvariant_model_type == "bioskrybv2" \
+        ? '--channel_list "BASE_CHANNELS,allele_frequency,identity,insert_size"' : ""
     """
     set -e
     export DV_BIN_PATH=/opt/deepvariant/bin
@@ -75,6 +84,7 @@ process DEEPVARIANT_MAKE_EXAMPLES_ONLY {
       --examples "${sample_name}.tfrecord@${task.cpus}.gz" \\
       --checkpoint "${deepvariant_model}/${params.checkpoint_filename}" \\
       --population_vcfs="\${population_vcfs_list}" \\
+      ${channel_arg} \\
       ${gvcf_arg} \\
       ${regions_arg} \\
       --task {}

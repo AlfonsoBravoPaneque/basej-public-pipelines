@@ -126,6 +126,13 @@
                     "fa_icon": "fas fa-key",
                     "default": 12345,
                     "hidden": true
+                },
+                "skip_gene_body_coverage": {
+                    "type": "boolean",
+                    "description": "Skip gene body (transcript body) coverage analysis.",
+                    "help_text": "When false (default) the pipeline computes per-sample transcript body coverage over housekeeping genes (RatioTranscriptBody, RangeTranscriptBody, MedianCoverageTranscriptBody) and an aggregate coverage plot. Automatically skipped for genomes without a housekeeping-gene bed (genebody_ref); only GRCh38 and GRCm39 define one.",
+                    "fa_icon": "fas fa-chart-area",
+                    "default": false
                 }
             }
         }

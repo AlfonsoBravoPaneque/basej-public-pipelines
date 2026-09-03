@@ -20,7 +20,7 @@ BUILDS=(
   "preseq_bam2mr:basejumper_preseq_bam2mr_0.1"
   "ginko_parser:basejumper_ginko_parser_0.2.1"
   "custom_parabricks-metrics:basejumper_custom_parabricks-metrics_1.0.3"
-  "custom_r_qcplots:basejumper_custom_r_qcplots_0.2.1"
+  "custom_r_qcplots:basejumper_custom_r_qcplots_0.3.0"
 )
 
 echo "BUILD STARTED: $(date)" | tee -a "$SUMMARY"
