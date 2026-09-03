@@ -42,7 +42,15 @@ process MERGE_MULTILANE_FASTQ {
 // Description: Optional subsampling — count reads with zcat + wc,
 //              then if total reads > max_total_reads, seqkit sample -p (no two-pass -2) caps reads.
 //              Paired: R1 then R2 sequentially with same PROPORTION/seed; -j 2.
-//              skip_subsampling=true by default.
+//              skip_subsampling=false by default (see nextflow.config), but the
+//              max_total_reads cap of 1e9 means most libraries pass through uncapped.
+//
+//              The raw pre-subsampling read count is written to
+//              <sample>_read_counts.txt (line 1 = TOTAL_READS, line 2 = FINAL_READS)
+//              in the same 2-line format as SAMTOOLS_SUBSAMPLE_CRAM, so
+//              WGS_QC_METRICS_TO_PARQUET can report `total_reads` as the original
+//              input read count — matching basej-dnaqc/basej-rnaqc and the legacy
+//              nf-wgs-pipeline COUNT_READS_FASTQ definition (R1 records + R2 records).
 // ============================================================================
 process SEQKIT_SAMPLE {
     tag "${sample_name}"
@@ -53,6 +61,7 @@ process SEQKIT_SAMPLE {
 
     output:
     tuple val(sample_name), path("${sample_name}_subsampled_R*.fastq.gz"), emit: reads
+    path("${sample_name}_read_counts.txt"), emit: read_counts_file
 
     script:
     def r1 = reads[0]
@@ -85,6 +94,7 @@ process SEQKIT_SAMPLE {
         cp '${r1}' '${sample_name}_subsampled_R1.fastq.gz' &
         ${copy_r2}
         wait
+        FINAL_READS=\$TOTAL_READS
     else
         echo "Subsampling to \$TARGET total reads with seqkit sample -p -j 2 (R1 then R2, no two-pass)..."
         export PROPORTION=\$(awk -v t="\$TARGET" -v tot="\$TOTAL_READS" 'BEGIN { printf "%.18f", t/tot }')
@@ -94,7 +104,25 @@ process SEQKIT_SAMPLE {
         if [ "${paired}" = "true" ]; then
           test -f '${sample_name}_subsampled_R1.fastq.gz' && test -f '${sample_name}_subsampled_R2.fastq.gz' || { echo "ERROR: subsampling did not produce both mates"; exit 1; }
         fi
+        # Recount both mates so FINAL_READS matches the TOTAL_READS unit (R1+R2).
+        # Only reached when the library actually exceeded max_total_reads (1e9 by
+        # default), so this extra decompression pass is rare.
+        R1_SUB=\$(zcat '${sample_name}_subsampled_R1.fastq.gz' | wc -l | awk '{printf "%.0f", \$1/4}')
+        if [ "${paired}" = "true" ]; then
+            R2_SUB=\$(zcat '${sample_name}_subsampled_R2.fastq.gz' | wc -l | awk '{printf "%.0f", \$1/4}')
+            FINAL_READS=\$((R1_SUB + R2_SUB))
+        else
+            FINAL_READS=\$R1_SUB
+        fi
     fi
+
+    echo "Final reads (all mates): \$FINAL_READS"
+
+    # Raw input read count for WGS_QC_METRICS_TO_PARQUET.
+    # Line 1 = TOTAL_READS (pre-subsampling), line 2 = FINAL_READS (post-subsampling).
+    # Same format as SAMTOOLS_SUBSAMPLE_CRAM / basej-dnaqc / basej-rnaqc.
+    echo "\$TOTAL_READS" > '${sample_name}_read_counts.txt'
+    echo "\$FINAL_READS" >> '${sample_name}_read_counts.txt'
     """
 }
 
@@ -947,7 +975,21 @@ PYEOF
 //              qc_status is set to PENDING (cluster QC scoring added later).
 //              WGS coverage fields are null for exome; HS fields are null for WGS.
 //              all_metrics: collected dedup + sentieon + picard (exome only) files.
-//              total_reads comes from AlignmentStat (post-subsampling when enabled).
+//
+//              Read-count reporting (two distinct columns):
+//                total_reads       — original input read count (R1 records + R2
+//                                    records), from SEQKIT_SAMPLE (FASTQ) or
+//                                    SAMTOOLS_SUBSAMPLE_CRAM (CRAM) via
+//                                    <sample>_read_counts.txt. Matches
+//                                    basej-dnaqc/basej-rnaqc and the legacy
+//                                    nf-wgs-pipeline COUNT_READS_FASTQ definition.
+//                                    Falls back to align_total_reads when no raw
+//                                    count exists (bulk mode, skip_subsampling),
+//                                    so the R depth-floor gate always has a value.
+//                align_total_reads — AlignmentStat/Picard TOTAL_READS from the
+//                                    deduplicated BAM/CRAM (post-subsampling).
+//                                    Always populated. Equivalent to the legacy
+//                                    "Total Reads After Dedup" metric.
 // ============================================================================
 process WGS_QC_METRICS_TO_PARQUET {
     tag "wgsqc_metrics_to_parquet"
@@ -999,8 +1041,11 @@ if not sample_names:
 
 print(f"Found {len(sample_names)} samples: {sorted(sample_names)}")
 
-# ========== Load read counts from CRAM subsampling (Ultima platform only) ==========
-# readcount_files are staged by Nextflow into the work directory
+# ========== Load original input read counts ==========
+# Written by SEQKIT_SAMPLE (FASTQ) and SAMTOOLS_SUBSAMPLE_CRAM (CRAM);
+# staged by Nextflow into the work directory. Line 1 = TOTAL_READS
+# (pre-subsampling), line 2 = FINAL_READS (post-subsampling).
+# Absent in bulk mode and when skip_subsampling=true.
 readcount_map = {}
 for f in glob.glob("*_read_counts.txt"):
     try:
@@ -1009,8 +1054,11 @@ for f in glob.glob("*_read_counts.txt"):
             if len(lines) >= 1:
                 sample = os.path.basename(f).replace("_read_counts.txt", "")
                 total = int(lines[0])  # First line is TOTAL_READS
-                readcount_map[sample] = {"total_reads": total}
-                print(f"Loaded read counts for {sample}: total={total}")
+                entry = {"total_reads": total}
+                if len(lines) >= 2:
+                    entry["final_reads"] = int(lines[1])
+                readcount_map[sample] = entry
+                print(f"Loaded read counts for {sample}: {entry}")
     except Exception as e:
         print(f"Warning: Could not parse {f}: {e}")
 print(f"DEBUG: Found {len(readcount_map)} samples with read count files")
@@ -1036,8 +1084,8 @@ for sample in sorted(sample_names):
     # Picard CollectAlignmentSummaryMetrics / Sentieon AlignmentStat emits one
     # row per CATEGORY: FIRST_OF_PAIR, SECOND_OF_PAIR, PAIR (paired-end), or
     # UNPAIRED (single-end, e.g. Ultima CRAM). Prefer PAIR; fall back to
-    # UNPAIRED so single-end data still populates total_reads, mismatch rate,
-    # mean_read_length, etc. PCT_CHIMERAS is undefined for single-end and
+    # UNPAIRED so single-end data still populates align_total_reads, mismatch
+    # rate, mean_read_length, etc. PCT_CHIMERAS is undefined for single-end and
     # remains 0.0 in that case.
     for f in glob.glob(f"{sample}*.alignmentstat_sentieonmetrics.txt"):
         try:
@@ -1056,7 +1104,7 @@ for sample in sorted(sample_names):
                                 rows_by_cat[cat] = dict(zip(headers, parts))
                 d = rows_by_cat.get("PAIR") or rows_by_cat.get("UNPAIRED")
                 if d:
-                    summary["total_reads"]               = int(d.get("TOTAL_READS", 0))
+                    summary["align_total_reads"]         = int(d.get("TOTAL_READS", 0))
                     summary["pf_reads_aligned"]          = int(d.get("PF_READS_ALIGNED", 0))
                     summary["pf_aligned_bases"]          = int(d.get("PF_ALIGNED_BASES", 0))
                     summary["pf_hq_aligned_reads"]       = int(d.get("PF_HQ_ALIGNED_READS", 0))
@@ -1100,10 +1148,18 @@ for sample in sorted(sample_names):
         except Exception as e:
             print(f"Warning: Could not parse QualityYield for {sample}: {e}")
 
-    # ========== Override total_reads from CRAM subsampling if available ==========
+    # ========== Set total_reads from the original input read count ==========
+    # Preferred source for total_reads: the raw pre-subsampling count written by
+    # SEQKIT_SAMPLE (FASTQ) or SAMTOOLS_SUBSAMPLE_CRAM (CRAM). This is the
+    # legacy nf-wgs-pipeline definition and matches basej-dnaqc/basej-rnaqc.
+    # When absent (bulk mode, skip_subsampling=true) the fallback to
+    # align_total_reads is applied in the "Ensure all expected fields" block below.
     if sample in readcount_map:
         summary["total_reads"] = readcount_map[sample]["total_reads"]
-        print(f"Overrode total_reads for {sample} with CRAM subsampling count: {summary['total_reads']}")
+        summary["total_reads_source"] = "raw_input"
+        if "final_reads" in readcount_map[sample]:
+            summary["final_reads"] = readcount_map[sample]["final_reads"]
+        print(f"Set total_reads for {sample} from raw input count: {summary['total_reads']}")
 
     # ========== Parse Dedup Metrics ==========
     for f in glob.glob(f"{sample}*.dedup_sentieonmetrics.txt"):
@@ -1351,8 +1407,20 @@ for sample in sorted(sample_names):
     # ========== Ensure all expected fields are set ==========
     if "pct_chimeras" not in summary:
         summary["pct_chimeras"] = 0.0
+    if "align_total_reads" not in summary:
+        summary["align_total_reads"] = 0
+
+    # total_reads falls back to the aligned count when no raw input count was
+    # produced (bulk mode, skip_subsampling=true). Without this the R depth-floor
+    # gate would see 0 and WGS_QC_PLOTS would force FAIL on every sample.
+    # A raw count that is legitimately 0 is kept as-is (and still FAILs), so the
+    # presence check is on the key, not on truthiness.
     if "total_reads" not in summary:
-        summary["total_reads"] = 0
+        summary["total_reads"] = summary["align_total_reads"]
+        summary["total_reads_source"] = "alignment"
+
+    if "final_reads" not in summary:
+        summary["final_reads"] = None
 
     all_summaries.append(summary)
 
@@ -1366,15 +1434,15 @@ for sample in sorted(sample_names):
         f.write("# pconfig:\\n")
         f.write(f"#   id: '{mode_prefix}qc_summary_table'\\n")
         if mode == 'wgs':
-            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tPCT_Duplication\\tPCT_1x\\tPCT_5x\\tPCT_10x\\tPCT_30x\\tPCT_Chimeras\\tMean_Coverage\\tInsert_Median\\tAT_Dropout\\tGC_Dropout\\n")
-            f.write(f"{sample}\\tPENDING\\tNA\\t{summary.get('total_reads', 0)}\\t{summary.get('pct_duplication', 0):.4f}\\t")
+            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tAlign_Total_Reads\\tPCT_Duplication\\tPCT_1x\\tPCT_5x\\tPCT_10x\\tPCT_30x\\tPCT_Chimeras\\tMean_Coverage\\tInsert_Median\\tAT_Dropout\\tGC_Dropout\\n")
+            f.write(f"{sample}\\tPENDING\\tNA\\t{summary.get('total_reads', 0)}\\t{summary.get('align_total_reads', 0)}\\t{summary.get('pct_duplication', 0):.4f}\\t")
             f.write(f"{summary.get('pct_1x', 0) or 0:.4f}\\t{summary.get('pct_5x', 0) or 0:.4f}\\t")
             f.write(f"{summary.get('pct_10x', 0) or 0:.4f}\\t{summary.get('pct_30x', 0) or 0:.4f}\\t")
             f.write(f"{summary.get('pct_chimeras', 0):.4f}\\t{summary.get('mean_coverage', 0) or 0:.2f}\\t")
             f.write(f"{summary.get('insert_median', 0) or 0:.0f}\\t{summary.get('at_dropout', 0) or 0:.4f}\\t{summary.get('gc_dropout', 0) or 0:.4f}\\n")
         else:
-            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tPCT_Target_10x\\tZero_Cvg_Targets_Pct\\tFold_80_Base_Penalty\\tMean_Target_Coverage\\tPCT_Selected_Bases\\tInsert_Median\\tPCT_Chimeras\\n")
-            f.write(f"{sample}\\tPENDING\\tNA\\t{summary.get('total_reads', 0)}\\t")
+            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tAlign_Total_Reads\\tPCT_Target_10x\\tZero_Cvg_Targets_Pct\\tFold_80_Base_Penalty\\tMean_Target_Coverage\\tPCT_Selected_Bases\\tInsert_Median\\tPCT_Chimeras\\n")
+            f.write(f"{sample}\\tPENDING\\tNA\\t{summary.get('total_reads', 0)}\\t{summary.get('align_total_reads', 0)}\\t")
             f.write(f"{summary.get('pct_target_bases_10x', 0) or 0:.4f}\\t{summary.get('zero_cvg_targets_pct', 0) or 0:.4f}\\t")
             f.write(f"{summary.get('fold_80_base_penalty', 0) or 0:.4f}\\t{summary.get('mean_target_coverage', 0) or 0:.2f}\\t")
             f.write(f"{summary.get('pct_selected_bases', 0) or 0:.4f}\\t{summary.get('insert_median', 0) or 0:.0f}\\t")
@@ -1384,7 +1452,8 @@ for sample in sorted(sample_names):
 
 # ========== Write Parquets ==========
 _str_cols    = ['biosample','dataset_id','pipeline','pipeline_version','molecule_type',
-                'mode','genome','workspace','workflow_id','user','qc_status']
+                'mode','genome','workspace','workflow_id','user','qc_status',
+                'total_reads_source']
 _double_cols = ['pct_duplication','pf_mismatch_rate','pf_hq_error_rate','pf_indel_rate',
                 'pct_reads_aligned_in_pairs','pct_chimeras','pct_adapter','strand_balance',
                 'mean_read_length',
@@ -1403,7 +1472,7 @@ _double_cols = ['pct_duplication','pf_mismatch_rate','pf_hq_error_rate','pf_inde
                 'pct_target_bases_1x','pct_target_bases_2x','pct_target_bases_10x','pct_target_bases_20x',
                 'pct_target_bases_30x','pct_target_bases_40x','pct_target_bases_50x','pct_target_bases_100x',
                 'pct_target_bases_250x','pct_target_bases_500x','pct_target_bases_1000x']
-_bigint_cols = ['total_reads','pf_reads_aligned',
+_bigint_cols = ['total_reads','final_reads','align_total_reads','pf_reads_aligned',
                 'pf_aligned_bases','pf_hq_aligned_reads','pf_hq_aligned_bases','pf_hq_aligned_q20_bases',
                 'estimated_library_size','read_pairs_examined',
                 'read_pair_duplicates','read_pair_optical_duplicates','insert_read_pairs',
@@ -1543,7 +1612,8 @@ print(f"Found {len(all_df)} samples to update")
 
 # ========== Schema definitions (mirrors WGS_QC_METRICS_TO_PARQUET + qc_score) ==========
 _str_cols    = ['biosample', 'dataset_id', 'pipeline', 'pipeline_version', 'molecule_type',
-                'mode', 'genome', 'workspace', 'workflow_id', 'user', 'qc_status']
+                'mode', 'genome', 'workspace', 'workflow_id', 'user', 'qc_status',
+                'total_reads_source']
 _double_cols = ['pct_duplication', 'pf_mismatch_rate', 'pf_hq_error_rate', 'pf_indel_rate',
                 'pct_reads_aligned_in_pairs', 'pct_chimeras', 'pct_adapter', 'strand_balance',
                 'mean_read_length',
@@ -1562,7 +1632,7 @@ _double_cols = ['pct_duplication', 'pf_mismatch_rate', 'pf_hq_error_rate', 'pf_i
                 'pct_target_bases_1x', 'pct_target_bases_2x', 'pct_target_bases_10x', 'pct_target_bases_20x',
                 'pct_target_bases_30x', 'pct_target_bases_40x', 'pct_target_bases_50x', 'pct_target_bases_100x',
                 'pct_target_bases_250x', 'pct_target_bases_500x', 'pct_target_bases_1000x']
-_bigint_cols = ['total_reads', 'pf_reads_aligned',
+_bigint_cols = ['total_reads', 'final_reads', 'align_total_reads', 'pf_reads_aligned',
                 'pf_aligned_bases', 'pf_hq_aligned_reads', 'pf_hq_aligned_bases', 'pf_hq_aligned_q20_bases',
                 'estimated_library_size', 'read_pairs_examined',
                 'read_pair_duplicates', 'read_pair_optical_duplicates', 'insert_read_pairs',
@@ -1613,15 +1683,15 @@ for _, row in all_df.iterrows():
         f.write("# pconfig:\\n")
         f.write(f"#   id: '{mode_prefix}qc_summary_table'\\n")
         if mode == "wgs":
-            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tPCT_Duplication\\tPCT_1x\\tPCT_5x\\tPCT_10x\\tPCT_30x\\tPCT_Chimeras\\tMean_Coverage\\tInsert_Median\\tAT_Dropout\\tGC_Dropout\\n")
-            f.write(f"{sample}\\t{status}\\t{score_str}\\t{int(row.get('total_reads', 0) or 0)}\\t{float(row.get('pct_duplication', 0) or 0):.4f}\\t")
+            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tAlign_Total_Reads\\tPCT_Duplication\\tPCT_1x\\tPCT_5x\\tPCT_10x\\tPCT_30x\\tPCT_Chimeras\\tMean_Coverage\\tInsert_Median\\tAT_Dropout\\tGC_Dropout\\n")
+            f.write(f"{sample}\\t{status}\\t{score_str}\\t{int(row.get('total_reads', 0) or 0)}\\t{int(row.get('align_total_reads', 0) or 0)}\\t{float(row.get('pct_duplication', 0) or 0):.4f}\\t")
             f.write(f"{float(row.get('pct_1x', 0) or 0):.4f}\\t{float(row.get('pct_5x', 0) or 0):.4f}\\t")
             f.write(f"{float(row.get('pct_10x', 0) or 0):.4f}\\t{float(row.get('pct_30x', 0) or 0):.4f}\\t")
             f.write(f"{float(row.get('pct_chimeras', 0) or 0):.4f}\\t{float(row.get('mean_coverage', 0) or 0):.2f}\\t")
             f.write(f"{float(row.get('insert_median', 0) or 0):.0f}\\t{float(row.get('at_dropout', 0) or 0):.4f}\\t{float(row.get('gc_dropout', 0) or 0):.4f}\\n")
         else:
-            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tPCT_Target_10x\\tZero_Cvg_Targets_Pct\\tFold_80_Base_Penalty\\tMean_Target_Coverage\\tPCT_Selected_Bases\\tInsert_Median\\tPCT_Chimeras\\n")
-            f.write(f"{sample}\\t{status}\\t{score_str}\\t{int(row.get('total_reads', 0) or 0)}\\t")
+            f.write("sample_name\\tQC_Status\\tScore\\tTotal_Reads\\tAlign_Total_Reads\\tPCT_Target_10x\\tZero_Cvg_Targets_Pct\\tFold_80_Base_Penalty\\tMean_Target_Coverage\\tPCT_Selected_Bases\\tInsert_Median\\tPCT_Chimeras\\n")
+            f.write(f"{sample}\\t{status}\\t{score_str}\\t{int(row.get('total_reads', 0) or 0)}\\t{int(row.get('align_total_reads', 0) or 0)}\\t")
             f.write(f"{float(row.get('pct_target_bases_10x', 0) or 0):.4f}\\t{float(row.get('zero_cvg_targets_pct', 0) or 0):.4f}\\t")
             f.write(f"{float(row.get('fold_80_base_penalty', 0) or 0):.4f}\\t{float(row.get('mean_target_coverage', 0) or 0):.2f}\\t")
             f.write(f"{float(row.get('pct_selected_bases', 0) or 0):.4f}\\t{float(row.get('insert_median', 0) or 0):.0f}\\t")
@@ -1734,9 +1804,14 @@ custom_data:
         placement: 110
       Total_Reads:
         title: "Total Reads"
-        description: "Total number of read pairs"
+        description: "Original number of input reads, counted across both mates (R1 records + R2 records) before subsampling, trimming or alignment. Source: SEQKIT_SAMPLE (FASTQ) or SAMTOOLS_SUBSAMPLE_CRAM (CRAM). Falls back to Align_Total_Reads in bulk mode or when skip_subsampling is set."
         format: "{:,.0f}"
         placement: 120
+      Align_Total_Reads:
+        title: "Total Reads After Dedup"
+        description: "Total reads in the deduplicated alignment, including all PF and non-PF reads, counted across both mates. Reflects post-subsampling data. Source: Sentieon AlignmentStat / Picard CollectAlignmentSummaryMetrics TOTAL_READS."
+        format: "{:,.0f}"
+        placement: 125
       PCT_Duplication:
         title: "Proportion Duplication"
         description: "Proportion of duplicate read pairs (0-1). Source: Sentieon Dedup PERCENT_DUPLICATION. Note: coordinate-based detection may undercount duplicates in amplification-based chemistries."
@@ -2080,6 +2155,8 @@ workflow {
         // Bulk mode never subsamples — SPLIT_FASTQ keeps every read and the parts
         // are aligned below, so this whole stage is a no-op. The placeholder keeps
         // the parquet step's path() input non-empty.
+        // No raw read count is produced here, so total_reads falls back to
+        // align_total_reads (AlignmentStat) in WGS_QC_METRICS_TO_PARQUET.
         ch_aligned_reads     = channel.empty()
         ch_readcount_metrics = channel.of(file('/dev/null')).collect()
     } else if (use_coverage_subsample) {
@@ -2102,7 +2179,12 @@ workflow {
             params.samtools_seed
         )
 
-        // FASTQ branch follows the existing skip_subsampling logic
+        // FASTQ branch follows the existing skip_subsampling logic.
+        // SAMTOOLS_SUBSAMPLE_CRAM_PROPORTION doesn't write read_count files, so the
+        // raw input count is only available for the FASTQ side (SEQKIT_SAMPLE).
+        // CRAM samples on this path fall back to align_total_reads in
+        // WGS_QC_METRICS_TO_PARQUET. /dev/null keeps the parquet step's path()
+        // input non-empty (the Python glob for *_read_counts.txt won't match it).
         if (!params.skip_subsampling) {
             SEQKIT_SAMPLE(
                 ch_split_for_subsample.fastq.map { sample, reads, read_type -> [sample, reads, params.max_total_reads] },
@@ -2111,15 +2193,15 @@ workflow {
             ch_aligned_reads = SAMTOOLS_SUBSAMPLE_CRAM_PROPORTION.out.reads
                 .map { sample, cram, crai -> [sample, cram, "CRAM"] }
                 .mix(SEQKIT_SAMPLE.out.reads.map { sample, reads -> [sample, reads, "FASTQ"] })
+            ch_readcount_metrics = SEQKIT_SAMPLE.out.read_counts_file
+                .collect()
+                .ifEmpty([file('/dev/null')])
         } else {
             ch_aligned_reads = SAMTOOLS_SUBSAMPLE_CRAM_PROPORTION.out.reads
                 .map { sample, cram, crai -> [sample, cram, "CRAM"] }
                 .mix(ch_split_for_subsample.fastq.map { items -> [items[0], items[1], items[2]] })
+            ch_readcount_metrics = channel.of(file('/dev/null')).collect()
         }
-
-        // Coverage subsampling doesn't write read_count files; placeholder
-        // so the parquet step's path() input is non-empty.
-        ch_readcount_metrics = channel.of(file('/dev/null')).collect()
     } else if (!params.skip_subsampling) {
         ch_split_for_subsample = ch_reads_merged.branch {
             cram: it[it.size()-1] == "CRAM"  // read_type is last element
@@ -2145,9 +2227,12 @@ workflow {
             .map { sample, cram, crai -> [sample, cram, "CRAM"] }
             .mix(SEQKIT_SAMPLE.out.reads.map { sample, reads -> [sample, reads, "FASTQ"] })
         
-        // Collect read count files for Ultima/CRAM only
-        // Use /dev/null as fallback if no CRAM files (e.g., Illumina FASTQ-only run)
+        // Collect original input read counts from both branches: SEQKIT_SAMPLE
+        // (FASTQ) and SAMTOOLS_SUBSAMPLE_CRAM (CRAM). Either branch may be empty
+        // for a single-platform run, so mix first then fall back to /dev/null to
+        // keep the parquet step's path() input non-empty.
         ch_readcount_metrics = SAMTOOLS_SUBSAMPLE_CRAM.out.read_counts_file
+            .mix(SEQKIT_SAMPLE.out.read_counts_file)
             .collect()
             .ifEmpty([file('/dev/null')])
     } else {
@@ -2163,7 +2248,9 @@ workflow {
             }
         }
         // Use /dev/null as a placeholder to avoid empty channel error in Nextflow path() input
-        // Python glob for *_read_counts.txt won't match it, so it's effectively ignored
+        // Python glob for *_read_counts.txt won't match it, so it's effectively ignored.
+        // Nothing counts the raw FASTQs on this path, so total_reads falls back to
+        // align_total_reads (AlignmentStat) in WGS_QC_METRICS_TO_PARQUET.
         ch_readcount_metrics = channel.of(file('/dev/null')).collect()
     }
 
