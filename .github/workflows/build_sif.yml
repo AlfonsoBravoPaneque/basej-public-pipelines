@@ -2,9 +2,9 @@ name: Build SIF for BaseJ
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -15,20 +15,8 @@ jobs:
 
       - name: Locate and Build Docker Image
         run: |
-          echo "=== Listando estructura de basej-dnaqc ==="
-          find basej-dnaqc -maxdepth 3
-
-          # Buscar cualquier Dockerfile en el repositorio
           TARGET_DOCKERFILE=$(find . -iname "*dockerfile*" | head -n 1)
-
-          if [ -z "$TARGET_DOCKERFILE" ]; then
-            echo "ERROR: No se encontro ningun archivo Dockerfile en el repositorio."
-            exit 1
-          fi
-
-          echo "Usando Dockerfile encontrado en: $TARGET_DOCKERFILE"
           CONTEXT_DIR=$(dirname "$TARGET_DOCKERFILE")
-
           docker build -t basej-custom:latest -f "$TARGET_DOCKERFILE" "$CONTEXT_DIR"
           docker save basej-custom:latest -o basej-custom.tar
 
@@ -39,8 +27,9 @@ jobs:
         run: |
           apptainer build basej-custom.sif docker-archive://basej-custom.tar
 
-      - name: Upload SIF
-        uses: actions/upload-artifact@v4
+      - name: Release SIF file
+        uses: softprops/action-gh-release@v2
         with:
-          name: basej-dnaqc-custom-sif
-          path: basej-custom.sif
+          tag_name: v1.0.0
+          name: BaseJ Custom SIF
+          files: basej-custom.sif
