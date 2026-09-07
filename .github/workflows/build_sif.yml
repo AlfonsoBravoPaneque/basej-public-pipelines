@@ -15,8 +15,7 @@ jobs:
 
       - name: Build Docker Image
         run: |
-          cd basej-dnaqc/container
-          docker build -t basej-custom:latest .
+          docker build -t basej-custom:latest container/
           docker save basej-custom:latest -o basej-custom.tar
 
       - name: Install Apptainer
@@ -24,7 +23,7 @@ jobs:
 
       - name: Convert to SIF
         run: |
-          apptainer build basej-custom.sif docker-archive://basej-dnaqc/container/basej-custom.tar
+          apptainer build basej-custom.sif docker-archive://basej-custom.tar
 
       - name: Upload SIF
         uses: actions/upload-artifact@v4
