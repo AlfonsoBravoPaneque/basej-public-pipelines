@@ -13,9 +13,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build Docker Image
+      - name: Locate and Build Docker Image
         run: |
-          docker build -t basej-custom:latest basej-dnaqc/container/
+          echo "=== Listando estructura de basej-dnaqc ==="
+          find basej-dnaqc -maxdepth 3
+
+          # Buscar cualquier Dockerfile en el repositorio
+          TARGET_DOCKERFILE=$(find . -iname "*dockerfile*" | head -n 1)
+
+          if [ -z "$TARGET_DOCKERFILE" ]; then
+            echo "ERROR: No se encontro ningun archivo Dockerfile en el repositorio."
+            exit 1
+          fi
+
+          echo "Usando Dockerfile encontrado en: $TARGET_DOCKERFILE"
+          CONTEXT_DIR=$(dirname "$TARGET_DOCKERFILE")
+
+          docker build -t basej-custom:latest -f "$TARGET_DOCKERFILE" "$CONTEXT_DIR"
           docker save basej-custom:latest -o basej-custom.tar
 
       - name: Install Apptainer
