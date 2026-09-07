@@ -2,6 +2,9 @@ name: Build SIF for BaseJ
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   build:
@@ -16,7 +19,7 @@ jobs:
           docker build -t basej-custom:latest .
           docker save basej-custom:latest -o basej-custom.tar
 
-      - name: Install Apptainer / Singularity
+      - name: Install Apptainer
         uses: eWaterCycle/setup-apptainer@v2
 
       - name: Convert to SIF
@@ -27,4 +30,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: basej-dnaqc-custom-sif
-          path: basej-dnaqc/container/basej-custom.sif
+          path: basej-custom.sif
