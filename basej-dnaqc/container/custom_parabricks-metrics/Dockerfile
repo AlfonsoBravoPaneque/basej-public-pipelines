@@ -5,7 +5,7 @@
 # Build:
 #   docker build -t basejumper_custom_parabricks-metrics_1.0.3 .
 
-FROM python:3.8-slim-bullseye
+FROM python:3.10-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 
