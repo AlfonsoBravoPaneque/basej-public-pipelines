@@ -32,8 +32,8 @@ jobs:
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
-          context: ./basej-wgs/container/custom_parabricks-metrics
-          file: ./basej-wgs/container/custom_parabricks-metrics/Dockerfile
+          context: ./basej-dnaqc/container/custom_parabricks-metrics
+          file: ./basej-dnaqc/container/custom_parabricks-metrics/Dockerfile
           push: true
           tags: |
             ghcr.io/alfonsobravopaneque/basejumper_custom_parabricks-metrics:1.0.3
