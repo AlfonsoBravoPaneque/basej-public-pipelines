@@ -1,4 +1,5 @@
+numpy==1.24.4
 pandas==1.5.3
 multiqc==1.28
 pyarrow==14.0.2
-numpy=14.0.2
+
