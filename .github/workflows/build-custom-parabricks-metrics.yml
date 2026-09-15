@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - 'basej-dna/container/custom_parabricks-metrics/**'
+      - 'basej-dnaqc/container/custom_parabricks-metrics/**'
       - '.github/workflows/build-custom-parabricks-metrics.yml'
 
   workflow_dispatch:
