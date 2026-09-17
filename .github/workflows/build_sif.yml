@@ -21,7 +21,7 @@ jobs:
 
       - name: Build and Push
         run: |
-          cd basej-dnaqc/container
+          cd basej-wgs/container
           bash build_all_x86.sh
 
           USER=$(echo "${{ github.actor }}" | tr '[:upper:]' '[:lower:]')
